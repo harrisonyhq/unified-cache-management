@@ -68,6 +68,7 @@ class RequestBlockInfo:
     block_operations: list[BlockOperation] = field(default_factory=list)
     # Next block position to process
     start_position: int = 0
+    external_hit_blocks: int = 0
 
 
 @dataclass
@@ -115,6 +116,7 @@ class UnifiedCacheConnectorV1(KVConnectorBase_V1):
         )
         self.head_size = vllm_config.model_config.get_head_size()
         self.current_layer = 0
+        self.finished_reqs = []
         # request id -> succeed dumped blocks
         self.succeed_dumped_blocks: set[str] = set()
         if (
@@ -626,6 +628,7 @@ class UnifiedCacheConnectorV1(KVConnectorBase_V1):
                 block_hashes=block_hashes,
                 block_operations=block_operations,
                 start_position=start_position,
+                external_hit_blocks=num_lookup_hits,
             )
             self._need_load_reqs[request.request_id] = []
             return num_lookup_hits * self.block_size, True
@@ -643,6 +646,7 @@ class UnifiedCacheConnectorV1(KVConnectorBase_V1):
             block_hashes=block_hashes,
             block_operations=block_operations,
             start_position=start_position,
+            external_hit_blocks=num_lookup_hits,
         )
 
         return num_lookup_hits * self.block_size, False
@@ -653,11 +657,18 @@ class UnifiedCacheConnectorV1(KVConnectorBase_V1):
         """
         Update KVConnector state after block allocation.
         """
+        params = request.kv_transfer_params
+        request_block_info = self.request_block_infos.get(request.request_id, None)
+        external_hit_blocks = request_block_info.external_hit_blocks
+        logger.info(
+            "UCMConnector update_state_after_alloc: "
+            "num_external_tokens=%s, kv_transfer_params=%s",
+            external_hit_blocks, params)
         if request.request_id in self._need_load_reqs:
             local_block_ids = (
                 # since we use unhashed blocks, so we don't need to reset start_position
                 blocks.get_unhashed_block_ids()
-                if num_external_tokens > 0
+                if external_hit_blocks > 0
                 else []
             )
             self._need_load_reqs[request.request_id] = local_block_ids
@@ -668,7 +679,7 @@ class UnifiedCacheConnectorV1(KVConnectorBase_V1):
             start_position = request_block_info.start_position
             block_operations = request_block_info.block_operations
             block_hashes = request_block_info.block_hashes
-            start_create_pos = start_position + num_external_tokens // self.block_size
+            start_create_pos = start_position + external_hit_blocks
             remaining_hashes = block_hashes[start_create_pos:]
             if remaining_hashes:
                 create_results = self.connector.create(remaining_hashes)
@@ -679,6 +690,10 @@ class UnifiedCacheConnectorV1(KVConnectorBase_V1):
                     block_operations[idx] = (
                         BlockOperation.DUMP if ret == 0 else BlockOperation.NONE
                     )
+            if num_external_tokens == 0:
+                for idx, opr in enumerate(block_operations):
+                    if opr == BlockOperation.LOAD:
+                        block_operations[idx] = BlockOperation.NONE
             # set start_position to 0, so that we can process from the beginning
             request_block_info.start_position = 0
 
@@ -783,7 +798,21 @@ class UnifiedCacheConnectorV1(KVConnectorBase_V1):
         done_sending = list(connector_output.finished_sending)
         self.connector.commit(done_sending, True)
         self.succeed_dumped_blocks.update(done_sending)
-        connector_output.finished_sending = set()
+        if self.finished_reqs:
+            for reqs in self.finished_reqs:
+                block_info = self.request_block_infos.pop(reqs, None)
+                if block_info is not None:
+                    cancel_blocks = []
+                    for i, op in enumerate(block_info.block_operations):
+                        if op == BlockOperation.DUMP and block_info.block_hashes[i] not in self.succeed_dumped_blocks:
+                            cancel_blocks.append(block_info.block_hashes[i])
+                        if op == BlockOperation.DUMP and block_info.block_hashes[i] in self.succeed_dumped_blocks:
+                            self.succeed_dumped_blocks.remove(block_info.block_hashes[i])
+                    if cancel_blocks:
+                        self.connector.commit(cancel_blocks, False)
+            self.finished_reqs = []
+        current_reqs = set(self.request_block_infos.keys())
+        connector_output.finished_sending = connector_output.finished_sending & current_reqs
         return
 
     def request_finished(
@@ -791,18 +820,7 @@ class UnifiedCacheConnectorV1(KVConnectorBase_V1):
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
-        block_info = self.request_block_infos.pop(request.request_id, None)
-        if block_info is not None:
-            cancel_blocks = [
-                block_info.block_hashes[i]
-                for i, op in enumerate(block_info.block_operations)
-                if op == BlockOperation.DUMP
-                and block_info.block_hashes[i] not in self.succeed_dumped_blocks
-            ]
-            if cancel_blocks:
-                logger.debug(f"commit {cancel_blocks} to False.")
-                self.connector.commit(cancel_blocks, False)
-        self.succeed_dumped_blocks.clear()
+        self.finished_reqs.append(request.request_id)
         return False, None
 
     def _extract_blocks(
