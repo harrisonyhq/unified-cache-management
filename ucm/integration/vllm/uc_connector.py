@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Generator, List, Optional, Union
 
+import time
 import torch
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -36,7 +37,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorRole,
 )
-from vllm.distributed.parallel_state import get_world_group
+from vllm.distributed.parallel_state import get_world_group, GroupCoordinator, get_tp_group
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import Request, RequestStatus
 
@@ -89,9 +90,12 @@ class UnifiedCacheConnectorV1(KVConnectorBase_V1):
     def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole):
         super().__init__(vllm_config=vllm_config, role=role)
         self.block_size = vllm_config.cache_config.block_size
-        self.use_layerwise = True
+        self.use_layerwise = False
         self.kv_caches: dict[str, torch.Tensor] = {}
         self.total_tp_size = vllm_config.parallel_config.tensor_parallel_size
+        if role == KVConnectorRole.WORKER:
+            self.group_coordinator = get_tp_group()
+            self.broadcast_fn = self.group_coordinator.broadcast
         self.rank = (
             -1 if role == KVConnectorRole.SCHEDULER else get_world_group().local_rank
         )
@@ -100,6 +104,8 @@ class UnifiedCacheConnectorV1(KVConnectorBase_V1):
         self.dump_tasks: dict[str, dict[str, List[Task]]] = {}
         self.layerwise_load_tasks: dict[str, dict[str, tuple[Task, Task]]] = {}
         self.is_mla = self._vllm_config.model_config.is_deepseek_mla
+        if self.is_mla:
+            self.broadcast_stream = torch.cuda.Stream()
         self.num_layers = vllm_config.model_config.get_num_layers(
             vllm_config.parallel_config
         )
@@ -271,10 +277,14 @@ class UnifiedCacheConnectorV1(KVConnectorBase_V1):
             self._load_req_to_blocks.setdefault(request.request_id, set()).update(
                 vllm_block_ids
             )
+            layer_to_tensors = {}
             for layer_name, kv_layer in self.kv_caches.items():
                 tensors, offsets = self.get_tensor_and_offset_layerwise(
                     vllm_block_ids, kv_layer, layer_name
                 )
+                layer_to_tensors[layer_name] = tensors
+                if self.is_mla and self.rank != 0:
+                    continue
                 k_task_id = self.connector.load(
                     storage_block_ids, offsets[:blocks_len], tensors[:blocks_len]
                 )
@@ -306,17 +316,29 @@ class UnifiedCacheConnectorV1(KVConnectorBase_V1):
 
             if (
                 not self.use_layerwise
-                and request.request_id in self.layerwise_load_tasks
+                and (request.request_id in self.layerwise_load_tasks or self.is_mla)
             ):
-                for _, (k_task, v_task) in self.layerwise_load_tasks[
-                    request.request_id
-                ].items():
-                    if self.connector.wait(k_task) != 0:
-                        self._load_failed_reqs.add(request.request_id)
-                        break
-                    if v_task and self.connector.wait(v_task) != 0:
-                        self._load_failed_reqs.add(request.request_id)
-                        break
+                load_success = True
+                if not self.is_mla or self.rank == 0:
+                    for _, (k_task, v_task) in self.layerwise_load_tasks[
+                        request.request_id
+                    ].items():
+                        if self.connector.wait(k_task) != 0:
+                            load_success = False
+                            self._load_failed_reqs.add(request.request_id)
+                            break
+                        if v_task and self.connector.wait(v_task) != 0:
+                            load_success = False
+                            self._load_failed_reqs.add(request.request_id)
+                            break
+                if load_success and self.is_mla:
+                    with torch.cuda.stream(self.broadcast_stream):
+                        for layer_name, kv_layer in self.kv_caches.items():
+                            k_tensors = layer_to_tensors[layer_name][:blocks_len]
+                            # k_tensors = torch.stack(tensors[:blocks_len])
+                            for tensor_to_broadcast in k_tensors:
+                                self.broadcast_fn(tensor_to_broadcast, 0)
+                            
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """
