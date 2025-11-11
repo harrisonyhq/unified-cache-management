@@ -52,6 +52,15 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+if torch.cuda.is_available():
+    device = torch.cuda
+elif hasattr(torch, "npu") and torch.npu.is_available():
+    device = torch.npu
+else:
+    raise RuntimeError(
+        "No supported accelerator found. "
+        "Please ensure either CUDA or NPU is available."
+    )
 
 class BlockOperation(Enum):
     NONE = "none"
@@ -278,6 +287,7 @@ class UnifiedCacheConnectorV1(KVConnectorBase_V1):
                 vllm_block_ids
             )
             layer_to_tensors = {}
+            self.t = time.perf_counter()
             for layer_name, kv_layer in self.kv_caches.items():
                 tensors, offsets = self.get_tensor_and_offset_layerwise(
                     vllm_block_ids, kv_layer, layer_name
@@ -331,14 +341,35 @@ class UnifiedCacheConnectorV1(KVConnectorBase_V1):
                             load_success = False
                             self._load_failed_reqs.add(request.request_id)
                             break
+                t1 = time.perf_counter()
+                wait_time = t1 - self.t
                 if load_success and self.is_mla:
                     with torch.cuda.stream(self.broadcast_stream):
-                        for layer_name, kv_layer in self.kv_caches.items():
-                            k_tensors = layer_to_tensors[layer_name][:blocks_len]
-                            # k_tensors = torch.stack(tensors[:blocks_len])
-                            for tensor_to_broadcast in k_tensors:
-                                self.broadcast_fn(tensor_to_broadcast, 0)
-                            
+                        receive_dict = self._broadcast_or_receive_blocks(layer_to_tensors, blocks_len)
+                    self.broadcast_stream.synchronize()
+                if self.rank > 0 and receive_dict:
+                    for layer_name, kv_layer in self.kv_caches.items():
+                        received_tensor = receive_dict[layer_name]
+                        for i in range(blocks_len):
+                            layer_to_tensors[layer_name][i].copy_(received_tensor[i])
+                broadcast_time = time.perf_counter() - t1
+                logger.info(f"transfered {blocks_len} blocks on tp {self.rank}, wait time {wait_time * 1000}, broadcast time {broadcast_time*1000}")
+
+    def _broadcast_or_receive_blocks(self, layer_to_tensors: dict[str:torch.Tensor], blocks_len):
+        receive_dict = {}
+        for layer_name, kv_layer in self.kv_caches.items():
+            k_tensors = layer_to_tensors[layer_name][:blocks_len]
+            if self.rank == 0:
+                # # tensors = kv_layer[1:blocks_len+1]
+                tensor_to_broadcast = torch.stack(k_tensors, dim=0)
+                self.broadcast_fn(tensor_to_broadcast, 0)
+            else:
+                shape = (len(k_tensors), ) + k_tensors[0].shape
+                dtype = k_tensors[0].dtype
+                rec_tensor = torch.empty(shape, dtype=dtype, device=f"cuda:{self.rank}")
+                self.broadcast_fn(rec_tensor, 0)
+                receive_dict[layer_name] = rec_tensor
+        return receive_dict
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """
