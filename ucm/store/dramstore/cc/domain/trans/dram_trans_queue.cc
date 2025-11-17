@@ -23,6 +23,8 @@
  * */
 
 #include "dram_trans_queue.h"
+#include <cstring>
+#include <string> 
 
 namespace UC {
 
@@ -33,14 +35,14 @@ Status DramTransQueue::Setup(const int32_t deviceId, TaskSet* failureSet,
     this->memPool_ = memPool;
     auto success =
         this->backend_.SetWorkerInitFn([this](auto& device) { return this->Init(device); })
-            .SetWorkerFn([this](auto& shards, const auto& device) { this->Work(shards, device); })
+            .SetWorkerFn([this](auto& shard, const auto& device) { this->Work(shard, device); })
             .SetWorkerExitFn([this](auto& device) { this->Exit(device); })
             .Run();
     return success ? Status::OK() : Status::Error();
 }
 
 void DramTransQueue::Push(std::list<Task::Shard>& shards) noexcept {
-    this->backend_.Push(std::move(shards));
+    this->backend_.Push(shards);
 }
 
 bool DramTransQueue::Init(Device& device) {
@@ -56,71 +58,88 @@ void DramTransQueue::Exit(Device& device) {
     device.reset();
 }
 
-void DramTransQueue::Work(std::list<Task::Shard>& shards, const Device& device) {
-    auto it = shards.begin();
-    if (this->failureSet_->Contains(it->owner)) {
-        this->Done(shards, device, true);
+void DramTransQueue::Work(Task::Shard& shard, const Device& device) {
+    if (this->failureSet_->Contains(shard.owner)) {
+        this->Done(shard, device, true);
+        return;
     }
     auto status = Status::OK();
-    if (it->type == Task::Type::DUMP) {
-        status = this->D2H(shards, device);
+    if (shard.type == Task::Type::DUMP) {
+        status = this->D2H(shard, device);
     } else {
-        status = this->H2D(shards, device);
+        status = this->H2D(shard, device);
     }
-    this->Done(shards, device, status.Success());
+    this->Done(shard, device, status.Success());
 }
 
-Status DramTransQueue::H2D(std::list<Task::Shard>& shards, const Device& device) {
-    size_t pool_offset = 0;
-    std::vector<std::byte*> host_addrs(shards.size());
-    std::vector<std::byte*> device_addrs(shards.size());
-    int shard_index = 0;
-    for (auto& shard : shards) {
-        bool found = this->memPool_->GetOffset(shard.block, &pool_offset);
-        if (!found) {
-            return Status::Error();
-        }
-        auto host_addr = this->memPool_->GetStartAddr().get() + pool_offset + shard.offset;       
-        auto device_addr = shard.address;
-        host_addrs[shard_index] = host_addr;
-        device_addrs[shard_index] = reinterpret_cast<std::byte*>(device_addr);
-        shard_index++;
+Status DramTransQueue::H2D(Task::Shard& shard, const Device& device) {
+    // 1. 获取 pin memory buffer (hub)
+    shard.buffer = device->GetBuffer(shard.length);
+    if (!shard.buffer) {
+        UC_ERROR("Out of memory({}).", shard.length);
+        return Status::OutOfMemory();
     }
-    auto it = shards.begin();
-    return device->H2DBatchSync(device_addrs.data(), const_cast<const std::byte**>(host_addrs.data()), shards.size(), it->length);
+    auto hub = shard.buffer.get();
+    
+    // 2. 从 memory pool 读取数据到 pin memory (hub)
+    if (!this->memPool_) {
+        UC_ERROR("MemoryPool is null.");
+        return Status::Error();
+    }
+    std::string blockKey = shard.block + "_" + std::to_string(shard.offset);
+    size_t blockOffset = 0;
+    if (!this->memPool_->GetOffset(blockKey, &blockOffset)) {
+        UC_ERROR("Block({}) not found in memory pool.", shard.block);
+        return Status::Error();
+    }
+    auto poolStart = this->memPool_->GetStartAddr().get();
+    auto poolSrc = poolStart + blockOffset;
+    std::memcpy(hub, poolSrc, shard.length);
+    
+    // 3. 从 pin memory (hub) 传输到 GPU (shard.address)
+    return device->H2DAsync((std::byte*)shard.address, (std::byte*)hub, shard.length);
 }
 
-Status DramTransQueue::D2H(std::list<Task::Shard>& shards, const Device& device) {
-    size_t pool_offset = 0;
-    std::vector<std::byte*> host_addrs(shards.size());
-    std::vector<std::byte*> device_addrs(shards.size());
-    int shard_index = 0;
-    for (auto& shard : shards) {
-        bool found = this->memPool_->GetOffset(shard.block, &pool_offset);
-        if (!found) {
-            return Status::Error();
-        }
-        auto host_addr = this->memPool_->GetStartAddr().get() + pool_offset + shard.offset;       
-        auto device_addr = shard.address;
-        host_addrs[shard_index] = host_addr;
-        device_addrs[shard_index] = reinterpret_cast<std::byte*>(device_addr);
-        shard_index++;
+Status DramTransQueue::D2H(Task::Shard& shard, const Device& device) {
+    // 1. 获取 pin memory buffer (hub)
+    shard.buffer = device->GetBuffer(shard.length);
+    if (!shard.buffer) {
+        UC_ERROR("Out of memory({}).", shard.length);
+        return Status::OutOfMemory();
     }
-    auto it = shards.begin();
-    return device->D2HBatchSync(host_addrs.data(), const_cast<const std::byte**>(device_addrs.data()), shards.size(), it->length);
+    auto hub = shard.buffer.get();
+    
+    // 2. 从 GPU (shard.address) 传输到 pin memory (hub)
+    auto status = device->D2HSync((std::byte*)hub, (std::byte*)shard.address, shard.length);
+    if (status.Failure()) {
+        return status;
+    }
+    
+    // 3. 从 pin memory (hub) 写入到 memory pool
+    if (!this->memPool_) {
+        UC_ERROR("MemoryPool is null.");
+        return Status::Error();
+    }
+    std::string blockKey = shard.block + "_" + std::to_string(shard.offset);
+    size_t blockOffset = 0;
+    if (!this->memPool_->GetOffset(blockKey, &blockOffset)) {
+        UC_ERROR("Block({}) not found in memory pool.", shard.block);
+        return Status::Error();
+    }
+    auto poolStart = this->memPool_->GetStartAddr().get();
+    auto poolDst = poolStart + blockOffset;
+    std::memcpy(poolDst, hub, shard.length);
+    
+    return Status::OK();
 }
 
-void DramTransQueue::Done(std::list<Task::Shard>& shards, const Device& device, const bool success) {
-    auto it = shards.begin();
-    if (!success) { this->failureSet_->Insert(it->owner); }
-    for (auto& shard : shards) { 
-        if (shard.done) {
-            if (device) {
-                if (device->Synchronized().Failure()) { this->failureSet_->Insert(shard.owner); }
-            }
-            shard.done();
-        }
+void DramTransQueue::Done(Task::Shard& shard, const Device& device, const bool success) {
+    if (!success) { this->failureSet_->Insert(shard.owner); }
+    if (!shard.done) { return; }
+    if (device) {
+        if (device->Synchronized().Failure()) { this->failureSet_->Insert(shard.owner); }
     }
+    shard.done();
 }
 
 } // namespace UC

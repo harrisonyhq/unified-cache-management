@@ -30,6 +30,8 @@ import torch
 from ucm.logger import init_logger
 from ucm.store.ucmstore import Task, UcmKVStoreBase
 
+from ucm.store.dramstore import ucmdramstore
+
 logger = init_logger(__name__)
 
 SUCCESS = 0
@@ -48,8 +50,8 @@ else:
 
 @dataclass
 class DramTask(Task):
-    task_id: str = "1"
-    event: Optional[Any] = None
+    task_id: int = 0
+    block_ids: Optional[List[str]] = None
 
 
 class UcmDramStore(UcmKVStoreBase):
@@ -59,12 +61,31 @@ class UcmDramStore(UcmKVStoreBase):
 
     def __init__(self, config: Dict):
         super().__init__(config)
-        self.dram_cache: Dict[str, any] = {}
-        self.max_cache_byte = int(config.get("max_cache_size", 5368709120))
-        self.kv_block_size = int(config.get("kv_block_size", 262144))
-        self.max_block_num = self.max_cache_byte // self.kv_block_size
-        if config["role"] == "scheduler":
+        self.dram_cache: Dict[str, str] = {}  # key: block_id+offset, value: block_id
+        self.role = config.get("role", "worker")
+        self.store = None
+        
+        if self.role == "scheduler":
             self.cached_blocks = set()
+        else:
+            # worker侧：初始化C++ store            
+            self.store = ucmdramstore.DRAMStore()
+            
+            # 从config获取参数，使用默认值
+            capacity = int(config.get("capacity", 10737418240))  # Default 10GB
+            block_size = int(config.get("io_size", 262144))  # Default 256KB
+            device_id = int(config.get("device", 0))
+            stream_number = int(config.get("stream_number", 32))
+            timeout_ms = int(config.get("timeout_ms", 30000))
+            
+            param = ucmdramstore.DRAMStore.Config(
+                capacity, block_size, device_id, stream_number, timeout_ms
+            )
+            
+            ret = self.store.Setup(param)
+            if ret != 0:
+                msg = f"Failed to initialize ucmdramstore, errcode: {ret}."
+                raise RuntimeError(msg)
 
     def cc_store(self) -> int:
         """
@@ -73,6 +94,8 @@ class UcmDramStore(UcmKVStoreBase):
         Returns:
             cc pointer to Store
         """
+        if self.role == "worker" and self.store is not None:
+            return self.store.CCStoreImpl()
         return 0
 
     def create(self, block_ids: List[str]) -> List[int]:
@@ -122,16 +145,19 @@ class UcmDramStore(UcmKVStoreBase):
         Returns:
             task(Task).
         """
-        task = DramTask()
-        stream = device.Stream()
-        task.event = device.Event(enable_timing=True)
-        with device.stream(stream):
-            for i, block_id in enumerate(block_ids):
-                key = block_id + "_" + str(offset[i])
-                dst_tensor[i].copy_(self.dram_cache[key], non_blocking=True)
-            task.event.record(stream=stream)
-        logger.debug(f"load block {block_ids} finished.")
-        return task
+        if self.role != "worker" or self.store is None:
+            raise RuntimeError("load method should only be called from worker side")
+        
+        # 准备tensor指针和大小
+        dst_tensor_ptr = [t.data_ptr() for t in dst_tensor]
+        dst_tensor_size = [t.numel() * t.element_size() for t in dst_tensor]
+        
+        # 调用C++接口
+        task_id = self.store.Load(block_ids, offset, dst_tensor_ptr, dst_tensor_size)
+        
+        
+        logger.debug(f"load block {block_ids} finished, task_id: {task_id}.")
+        return DramTask(task_id=task_id)
 
     def dump(
         self, block_ids: List[str], offset: List[int], src_tensor: List[torch.Tensor]
@@ -146,23 +172,24 @@ class UcmDramStore(UcmKVStoreBase):
         Returns:
             task(Task).
         """
-        task = DramTask()
-        if len(self.dram_cache) > self.max_block_num:
-            logger.warning(
-                "Dram cache usage exceeds limit! No more kv cache offload! Try to increase your initial max_cache_size."
-            )
-            task.task_id = "-1"
-            return task
-        else:
-            stream = device.Stream()
-            task.event = device.Event(enable_timing=True)
-            with device.stream(stream):
-                for i, block_id in enumerate(block_ids):
-                    key = block_id + "_" + str(offset[i])
-                    self.dram_cache[key] = src_tensor[i].to("cpu", non_blocking=True)
-                task.event.record(stream=stream)
-        logger.debug(f"dump block {block_ids} finished.")
-        return task
+        block_offset_index = [f"{bid}_{off}" for bid, off in zip(block_ids, offset)]
+        create_result = set(self.store.AllocBatch(block_offset_index))
+        if FAILURE in create_result:
+            logger.warning(f"Dump failed: memory pool full or create failed, block_ids: {block_ids}")
+            return DramTask(task_id=-1, block_ids=block_ids)
+        # 准备tensor指针和大小
+        src_tensor_ptr = [t.data_ptr() for t in src_tensor]
+        src_tensor_size = [t.numel() * t.element_size() for t in src_tensor]
+        
+        # 调用C++接口（C++侧会在dump时自动调用create）
+        task_id = self.store.Dump(block_ids, offset, src_tensor_ptr, src_tensor_size)
+        
+        # 在dram_cache中保存标识符
+        for i, block_id in enumerate(block_ids):
+            key = block_id + "_" + str(offset[i])
+            self.dram_cache[key] = block_id
+        logger.debug(f"dump block {block_ids} finished, task_id: {task_id}.")
+        return DramTask(task_id=task_id, block_ids=block_ids)
 
     def fetch_data(
         self,
@@ -182,7 +209,8 @@ class UcmDramStore(UcmKVStoreBase):
         Returns:
             task(Task).
         """
-        pass
+        task_id = self.store.Load(block_ids, offset, dst_addr, size)
+        return DramTask(task_id=task_id)
 
     def dump_data(
         self,
@@ -202,7 +230,8 @@ class UcmDramStore(UcmKVStoreBase):
         Returns:
             task(Task).
         """
-        pass
+        task_id = self.store.Dump(block_ids, offset, src_addr, size)
+        return DramTask(task_id=task_id)
 
     def wait(self, task: DramTask) -> int:
         """
@@ -214,16 +243,15 @@ class UcmDramStore(UcmKVStoreBase):
             0 - success
             others - failed.
         """
-        if task.task_id == "-1":
-            logger.warning("Dump failure with full cache usage!")
+        if task.task_id == -1:
+            logger.warning("Dump failed with full memory pool or create failed")
             return FAILURE
-        try:
-            event = task.event
-            event.synchronize()
-            return SUCCESS
-        except Exception as e:
-            logger.error(f"Error waiting cache for block IDs: {e}")
-            return FAILURE
+        
+        # 调用C++接口（C++侧会在wait成功后自动调用commit）
+        ret = self.store.Wait(task.task_id)
+        # if ret == SUCCESS and task.block_ids is not None:
+        #     self.store.CommitBatch(task.block_ids, True)
+        return ret
 
     def commit(self, block_ids: List[str], is_success: bool = True) -> None:
         """
@@ -246,4 +274,4 @@ class UcmDramStore(UcmKVStoreBase):
             0 - finished
             others - in process.
         """
-        pass
+        return self.store.Check(task.task_id)
