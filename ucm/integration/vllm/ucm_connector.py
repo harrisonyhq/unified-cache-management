@@ -465,26 +465,12 @@ class UCMDirectConnector(KVConnectorBase_V1):
         ucm_total_block_ids = ucm_block_ids * repeat_times
 
         assert len(ucm_total_block_ids) == len(ucm_offsets) == len(dst_tensor_addr)
-        return ucm_total_block_ids, ucm_offsets, dst_tensor_addr, (k_tensor_addr, v_tensor_addr)
-
-    def _broadcast(self, dst_tensor_addr: list[torch.Tensor]):
-        rec_tensor: torch.Tensor = None
-        with self.torch_dev.stream(self.broadcast_stream):
-            # TODO support broadcast when PP
-            if self.global_rank == 0:
-                tensor_to_broadcast = torch.stack(dst_tensor_addr, dim=0)
-                self.broadcast_fn(tensor_to_broadcast, 0)
-            else:
-                shape = (len(dst_tensor_addr),) + dst_tensor_addr[0].shape
-                # TODO create earlier
-                rec_tensor = torch.empty(
-                    shape, dtype=self.kv_cache_dtype, device=self.device
-                )
-                self.broadcast_fn(rec_tensor, 0)
-        self.broadcast_stream.synchronize()
-        if self.global_rank != 0 and rec_tensor is not None:
-            for i, tensor in enumerate(dst_tensor_addr):
-                tensor.copy_(rec_tensor[i])
+        return (
+            ucm_total_block_ids,
+            ucm_offsets,
+            dst_tensor_addr,
+            (k_tensor_addr, v_tensor_addr),
+        )
 
     def _ensure_buffer(self, total_numel: int):
         if self._broadcast_buffer is None or self._broadcast_buffer_size < total_numel:
@@ -495,10 +481,10 @@ class UCMDirectConnector(KVConnectorBase_V1):
             )
             self._broadcast_buffer_size = total_numel
 
-    def _broadcast1(self, dst_tensor_addr: List[torch.Tensor]):
+    def _broadcast(self, dst_tensor_addr: list[torch.Tensor]):
         rec_tensor: torch.Tensor = None
         total_numel = len(dst_tensor_addr) * dst_tensor_addr[0].numel()
-        with torch.cuda.stream(self.broadcast_stream):
+        with self.torch_dev.stream(self.broadcast_stream):
             if self.global_rank == 0:
                 tensor_to_broadcast = torch.stack(dst_tensor_addr, dim=0)
                 self.broadcast_fn(tensor_to_broadcast, 0)
@@ -536,9 +522,12 @@ class UCMDirectConnector(KVConnectorBase_V1):
             if self.global_rank != 0 and not self.is_mla and not self.is_dsa:
                 for i, ucm_block_id in enumerate(ucm_block_ids):
                     ucm_block_ids[i] = str(self.request_hasher(ucm_block_id))
-            ucm_total_block_ids, ucm_offsets, dst_tensor_addr, (k_tensor_addr, v_tensor_addr) = self._generate_task(
-                vllm_block_ids, ucm_block_ids
-            )
+            (
+                ucm_total_block_ids,
+                ucm_offsets,
+                dst_tensor_addr,
+                (k_tensor_addr, v_tensor_addr),
+            ) = self._generate_task(vllm_block_ids, ucm_block_ids)
             if self.global_rank == 0 or not self.load_only_first_rank:
                 request_to_task[request_id] = self.store.load(
                     ucm_total_block_ids, ucm_offsets, dst_tensor_addr
@@ -554,12 +543,14 @@ class UCMDirectConnector(KVConnectorBase_V1):
                     logger.error(f"request {request_id} load kv cache failed.")
             if self.load_only_first_rank:
                 if self.is_mla:
-                    self._broadcast1(req_broadcast_addr[request_id][0])
+                    self._broadcast(req_broadcast_addr[request_id][0])
                 else:
                     for kv_addrs in req_broadcast_addr[request_id]:
-                        self._broadcast1(kv_addrs)
+                        self._broadcast(kv_addrs)
                     if not self.is_dsa:
-                        logger.warning("For best performance, do not load only first rank in non-mla models")
+                        logger.warning(
+                            "For best performance, do not load only first rank in non-mla models"
+                        )
 
         load_end_time = time.perf_counter() * 1000
         load_speed = (
@@ -634,7 +625,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 continue
             ucm_block_ids = ucm_block_ids[:end]
             vllm_block_ids = vllm_block_ids[:end]
-            ucm_total_block_ids, ucm_offsets, dst_tensor_addr = self._generate_task(
+            ucm_total_block_ids, ucm_offsets, dst_tensor_addr, _ = self._generate_task(
                 vllm_block_ids, ucm_block_ids
             )
             request_to_task[request_id] = self.store.dump(
