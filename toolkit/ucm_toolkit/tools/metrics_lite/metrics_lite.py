@@ -647,7 +647,51 @@ def row_float(row: Dict[str, object], key: str) -> Optional[float]:
 
 
 def format_time_label(timestamp: float) -> str:
-    return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.fromtimestamp(timestamp).strftime("%H:%M:%S")
+
+
+def plot_x_values(rows: List[Dict[str, object]]) -> List[float]:
+    first_timestamp = row_float(rows[0], "timestamp") if rows else None
+    values: List[float] = []
+    for row in rows:
+        elapsed = row_float(row, "elapsed_seconds")
+        if elapsed is not None:
+            values.append(elapsed)
+            continue
+
+        timestamp = row_float(row, "timestamp")
+        if timestamp is not None and first_timestamp is not None:
+            values.append(timestamp - first_timestamp)
+        else:
+            values.append(float(len(values)))
+    return values
+
+
+def plot_tick_values(
+    rows: List[Dict[str, object]],
+    x_values: List[float],
+    max_ticks: int = 6,
+) -> List[Tuple[float, str]]:
+    if not rows or not x_values:
+        return []
+
+    if len(rows) <= max_ticks:
+        indices = list(range(len(rows)))
+    else:
+        indices = sorted({
+            round(i * (len(rows) - 1) / (max_ticks - 1))
+            for i in range(max_ticks)
+        })
+
+    ticks: List[Tuple[float, str]] = []
+    for idx in indices:
+        timestamp = row_float(rows[idx], "timestamp")
+        if timestamp is None:
+            label = format_optional(x_values[idx])
+        else:
+            label = format_time_label(timestamp)
+        ticks.append((x_values[idx], label))
+    return ticks
 
 
 def write_svg_plot(
@@ -659,10 +703,8 @@ def write_svg_plot(
 ) -> bool:
     from xml.sax.saxutils import escape
 
-    x_values = [
-        row_float(row, "timestamp") or row_float(row, "elapsed_seconds") or 0.0
-        for row in rows
-    ]
+    x_values = plot_x_values(rows)
+    tick_values = plot_tick_values(rows, x_values)
     series: List[Tuple[str, List[Tuple[float, float]]]] = []
     y_values: List[float] = []
 
@@ -714,7 +756,7 @@ def write_svg_plot(
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="white"/>',
         f'<text x="{width / 2}" y="28" text-anchor="middle" font-family="Arial" font-size="20" fill="#111827">{escape(title)}</text>',
-        f'<text x="{width / 2}" y="{height - 18}" text-anchor="middle" font-family="Arial" font-size="13" fill="#374151">Time</text>',
+        f'<text x="{width / 2}" y="{height - 18}" text-anchor="middle" font-family="Arial" font-size="13" fill="#374151">Sample time (HH:MM:SS)</text>',
         f'<text x="18" y="{height / 2}" text-anchor="middle" font-family="Arial" font-size="13" fill="#374151" transform="rotate(-90 18 {height / 2})">{escape(ylabel)}</text>',
         f'<line x1="{left}" y1="{top + plot_height}" x2="{left + plot_width}" y2="{top + plot_height}" stroke="#374151" stroke-width="1"/>',
         f'<line x1="{left}" y1="{top}" x2="{left}" y2="{top + plot_height}" stroke="#374151" stroke-width="1"/>',
@@ -726,10 +768,8 @@ def write_svg_plot(
         parts.append(f'<line x1="{left}" y1="{y:.2f}" x2="{left + plot_width}" y2="{y:.2f}" stroke="#e5e7eb" stroke-width="1"/>')
         parts.append(f'<text x="{left - 8}" y="{y + 4:.2f}" text-anchor="end" font-family="Arial" font-size="11" fill="#4b5563">{value:.4g}</text>')
 
-    for i in range(6):
-        x = left + i * plot_width / 5
-        value = x_min + i * (x_max - x_min) / 5
-        label = format_time_label(value)
+    for value, label in tick_values:
+        x = sx(value)
         parts.append(f'<text x="{x:.2f}" y="{top + plot_height + 18}" text-anchor="end" font-family="Arial" font-size="10" fill="#4b5563" transform="rotate(-30 {x:.2f} {top + plot_height + 18})">{escape(label)}</text>')
 
     legend_x = left
@@ -761,24 +801,19 @@ def generate_plots(out_dir: Path) -> None:
         return
 
     plt = None
-    mdates = None
     try:
         import matplotlib
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        import matplotlib.dates as mdates
     except Exception as exc:
         print(f"[WARN] matplotlib is not available; generating SVG plots instead: {exc}")
 
     plot_dir = out_dir / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
 
-    x_values = [
-        row_float(row, "timestamp") or row_float(row, "elapsed_seconds") or 0.0
-        for row in rows
-    ]
-    x_datetimes = [datetime.fromtimestamp(x) for x in x_values]
+    x_values = plot_x_values(rows)
+    tick_values = plot_tick_values(rows, x_values)
 
     generated = 0
     for filename, columns, title, ylabel in PLOT_GROUPS:
@@ -794,7 +829,7 @@ def generate_plots(out_dir: Path) -> None:
         for column in columns:
             points = [
                 (x, row_float(row, column))
-                for x, row in zip(x_datetimes, rows)
+                for x, row in zip(x_values, rows)
                 if row_float(row, column) is not None
             ]
             if not points:
@@ -810,14 +845,15 @@ def generate_plots(out_dir: Path) -> None:
             continue
 
         ax = plt.gca()
-        if mdates is not None:
-            ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d %H:%M:%S"))
-        plt.xlabel("Time")
+        if tick_values:
+            ax.set_xticks([x for x, _ in tick_values])
+            ax.set_xticklabels([label for _, label in tick_values])
+        plt.xlabel("Sample time (HH:MM:SS)")
         plt.ylabel(ylabel)
         plt.title(title)
         plt.grid(True, alpha=0.3)
         plt.legend()
-        plt.gcf().autofmt_xdate(rotation=30, ha="right")
+        plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
         plt.tight_layout()
         out_path = plot_dir / f"{filename}.png"
         plt.savefig(out_path, dpi=160)
