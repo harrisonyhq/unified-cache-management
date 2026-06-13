@@ -35,6 +35,7 @@ import argparse
 import csv
 import gzip
 import hashlib
+import importlib.util
 import json
 import math
 import re
@@ -172,6 +173,46 @@ PLOT_GROUPS: List[Tuple[str, List[str], str, str]] = [
 ]
 
 
+CUMULATIVE_HISTOGRAM_SPECS: List[Tuple[str, str]] = [
+    ("time_to_first_token_seconds", "TTFT (s)"),
+    ("e2e_request_latency_seconds", "E2E Latency (s)"),
+    ("request_queue_time_seconds", "Queue Time (s)"),
+    ("request_inference_time_seconds", "Inference Time (s)"),
+    ("request_prefill_time_seconds", "Prefill Time (s)"),
+    ("request_decode_time_seconds", "Decode Time (s)"),
+    ("request_time_per_output_token_seconds", "Time per Output Token (s)"),
+]
+
+
+CUMULATIVE_CACHE_RATIO_SPECS: List[Tuple[str, Optional[str], str]] = [
+    ("prefix_cache_hits", "prefix_cache_queries", "vLLM Prefix Cache Hit Rate"),
+    (
+        "external_prefix_cache_hits",
+        "external_prefix_cache_queries",
+        "vLLM External Prefix Cache Hit Rate",
+    ),
+    ("interval_lookup_hit_rates", None, "UCM Interval Lookup Hit Rate"),
+]
+
+
+CUMULATIVE_COUNTER_BASES = [
+    "prefix_cache_hits",
+    "prefix_cache_queries",
+    "external_prefix_cache_hits",
+    "external_prefix_cache_queries",
+    "cache_load_backend_shards",
+    "cache_load_shards",
+]
+
+
+CUMULATIVE_SUMMARY_HISTOGRAM_BASES = [
+    name for name, _ in CUMULATIVE_HISTOGRAM_SPECS
+] + [
+    "request_generation_tokens",
+    "interval_lookup_hit_rates",
+]
+
+
 STOP_REQUESTED = False
 
 
@@ -281,6 +322,23 @@ def counter_candidate_names(metric_name: str) -> List[str]:
     return result
 
 
+def prefixed_metric_candidates(base_name: str, suffix: str) -> List[str]:
+    raw_name = f"{base_name}_{suffix}"
+    candidates = [
+        raw_name,
+        f"vllm:{raw_name}",
+        f"ucm:{raw_name}",
+    ]
+
+    seen = set()
+    result = []
+    for candidate in candidates:
+        if candidate not in seen:
+            result.append(candidate)
+            seen.add(candidate)
+    return result
+
+
 def required_metric_names() -> List[str]:
     names: List[str] = []
     for _, base_metric, _ in HISTOGRAM_AVG_SPECS:
@@ -291,6 +349,11 @@ def required_metric_names() -> List[str]:
     for _, numerator, denominator, _, _ in RATIO_SPECS:
         names.extend(counter_candidate_names(numerator))
         names.extend(counter_candidate_names(denominator))
+    for base_name in CUMULATIVE_SUMMARY_HISTOGRAM_BASES:
+        names.extend(prefixed_metric_candidates(base_name, "sum"))
+        names.extend(prefixed_metric_candidates(base_name, "count"))
+    for base_name in CUMULATIVE_COUNTER_BASES:
+        names.extend(prefixed_metric_candidates(base_name, "total"))
 
     seen = set()
     result = []
@@ -473,6 +536,153 @@ def format_optional(value: Optional[float]) -> str:
     if value is None or not math.isfinite(value):
         return ""
     return f"{value:.12g}"
+
+
+def strip_metric_namespace(metric_name: str) -> str:
+    if ":" in metric_name:
+        return metric_name.split(":")[-1]
+    return metric_name
+
+
+def split_metric_suffix(metric_name: str) -> Tuple[Optional[str], Optional[str]]:
+    for suffix in ("_count", "_sum", "_total"):
+        if metric_name.endswith(suffix):
+            return metric_name[: -len(suffix)], suffix[1:]
+    return None, None
+
+
+def build_cumulative_data(values: Dict[str, float]) -> Dict[str, Dict[str, float]]:
+    data: Dict[str, Dict[str, float]] = {}
+    for raw_name, value in values.items():
+        metric_name = strip_metric_namespace(raw_name)
+        base_name, kind = split_metric_suffix(metric_name)
+        if not base_name or not kind:
+            continue
+        metric_data = data.setdefault(base_name, {})
+        metric_data[kind] = metric_data.get(kind, 0.0) + value
+    return data
+
+
+def compute_cumulative_averages(
+    data: Dict[str, Dict[str, float]],
+) -> Dict[str, Optional[float]]:
+    results: Dict[str, Optional[float]] = {}
+    for metric, display in CUMULATIVE_HISTOGRAM_SPECS:
+        metric_data = data.get(metric)
+        if not metric_data:
+            results[display] = None
+            continue
+
+        count = metric_data.get("count")
+        total = metric_data.get("sum")
+        results[display] = safe_div(total, count)
+    return results
+
+
+def compute_cumulative_throughput(
+    data: Dict[str, Dict[str, float]],
+) -> Dict[str, float]:
+    tps: Dict[str, float] = {}
+
+    gen_tokens = data.get("request_generation_tokens", {}).get("sum")
+    prefill_time = data.get("request_prefill_time_seconds", {}).get("sum")
+    decode_time = data.get("request_decode_time_seconds", {}).get("sum")
+
+    decode_tps = safe_div(gen_tokens, decode_time)
+    if decode_tps is not None:
+        tps["Decode TPS"] = decode_tps
+
+    if gen_tokens is not None and prefill_time is not None and decode_time is not None:
+        overall_tps = safe_div(gen_tokens, prefill_time + decode_time)
+        if overall_tps is not None:
+            tps["Overall TPS"] = overall_tps
+
+    return tps
+
+
+def compute_cumulative_cache_rates(
+    data: Dict[str, Dict[str, float]],
+) -> Dict[str, Optional[float]]:
+    hit_rates: Dict[str, Optional[float]] = {}
+
+    for base_metric, denominator_metric, display_name in CUMULATIVE_CACHE_RATIO_SPECS:
+        metric_data = data.get(base_metric)
+        if not metric_data:
+            hit_rates[display_name] = None
+            continue
+
+        if denominator_metric is None:
+            hit_rates[display_name] = safe_div(
+                metric_data.get("sum"),
+                metric_data.get("count"),
+            )
+            continue
+
+        denominator_data = data.get(denominator_metric)
+        if not denominator_data:
+            hit_rates[display_name] = None
+            continue
+
+        hit_rates[display_name] = safe_div(
+            metric_data.get("total", 0.0),
+            denominator_data.get("total", 0.0),
+        )
+
+    backend_val = data.get("cache_load_backend_shards", {}).get("total")
+    shards_val = data.get("cache_load_shards", {}).get("total")
+    posix_fraction = safe_div(backend_val, shards_val)
+    if posix_fraction is not None:
+        hit_rates["Posix Store Load Fraction"] = posix_fraction
+        hit_rates["Cache Store Load Hit Fraction"] = 1.0 - posix_fraction
+
+    return hit_rates
+
+
+def compute_current_process_summary(
+    values: Dict[str, float],
+) -> Dict[str, object]:
+    data = build_cumulative_data(values)
+    return {
+        "total_requests": int(data.get("time_to_first_token_seconds", {}).get("count", 0)),
+        "total_generated_tokens": int(data.get("request_generation_tokens", {}).get("sum", 0)),
+        "averages": compute_cumulative_averages(data),
+        "throughput": compute_cumulative_throughput(data),
+        "cache_hit_rates": compute_cumulative_cache_rates(data),
+    }
+
+
+def print_current_process_summary(summary: Dict[str, object]) -> None:
+    print("\n=== vLLM Metrics Summary ===")
+    print(f"Total requests: {summary['total_requests']}")
+    print(f"Total generated tokens: {summary['total_generated_tokens']}")
+
+    print("\nAverage Latencies:")
+    averages = summary["averages"]
+    assert isinstance(averages, dict)
+    for display, value in averages.items():
+        if value is None:
+            print(f"  {display}: N/A")
+        else:
+            print(f"  {display}: {value:.4f}")
+
+    throughput = summary["throughput"]
+    assert isinstance(throughput, dict)
+    if throughput:
+        print("\nThroughput (TPS):")
+        for name, value in throughput.items():
+            print(f"  {name}: {value:.2f} tokens/s")
+
+    cache_hit_rates = summary["cache_hit_rates"]
+    assert isinstance(cache_hit_rates, dict)
+    if cache_hit_rates:
+        print("\nCache Hit Rates:")
+        for name, value in cache_hit_rates.items():
+            if value is None:
+                print(f"  {name}: N/A")
+            else:
+                print(f"  {name}: {value:.4f} ({value * 100:.2f}%)")
+
+    print("=" * 42)
 
 
 def write_manifest(out_dir: Path, args: argparse.Namespace, wanted_names: Sequence[str]) -> None:
@@ -967,6 +1177,7 @@ def collect_from_scrapes(
     previous_values: Optional[Dict[str, float]] = None
     previous_timestamp: Optional[float] = None
     start_timestamp: Optional[float] = None
+    last_values: Optional[Dict[str, float]] = None
 
     raw_path = out_dir / "raw_selected_samples.csv.gz"
     meta_path = out_dir / "scrape_meta.csv"
@@ -1074,6 +1285,7 @@ def collect_from_scrapes(
 
             previous_values = current_values
             previous_timestamp = scrape.timestamp
+            last_values = current_values
 
             print(
                 f"[INFO] scrape #{scrape_index}: selected_samples={len(selected_samples)}, "
@@ -1089,6 +1301,9 @@ def collect_from_scrapes(
     print(f"[INFO] summary saved to: {out_dir / 'summary.csv'}")
     print(f"[INFO] selected raw samples saved to: {raw_path}")
     print(f"[INFO] scrape metadata saved to: {meta_path}")
+
+    if last_values is not None:
+        print_current_process_summary(compute_current_process_summary(last_values))
 
     return summary
 
@@ -1127,6 +1342,28 @@ def run_collection(args: argparse.Namespace) -> SummaryAccumulator:
     return collect_from_scrapes(scrapes, args, filters)
 
 
+def summary_scrape(args: argparse.Namespace) -> ScrapeResult:
+    if args.replay_files:
+        file_args = argparse.Namespace(replay_files=[args.replay_files[0]], interval=args.interval)
+        return next(replay_scrape_loop(file_args))
+    if not args.url:
+        raise ValueError("--url is required unless --replay-files is used")
+    return scrape_http_once(args.url, args.timeout)
+
+
+def run_summary(args: argparse.Namespace) -> Dict[str, object]:
+    scrape = summary_scrape(args)
+    if not scrape.ok:
+        raise RuntimeError(scrape.error)
+
+    filters = build_label_filters(args)
+    samples = parse_selected_samples(scrape.text, required_metric_names(), filters)
+    values = aggregate_samples(samples)
+    summary = compute_current_process_summary(values)
+    print_current_process_summary(summary)
+    return summary
+
+
 def self_test_texts() -> List[str]:
     first = """
 # HELP vllm:e2e_request_latency_seconds request latency
@@ -1137,14 +1374,26 @@ vllm:e2e_request_latency_seconds_sum{model_name="other",worker_id="0"} 1000
 vllm:e2e_request_latency_seconds_count{model_name="other",worker_id="0"} 100
 vllm:time_to_first_token_seconds_sum{model_name="m",worker_id="0"} 2
 vllm:time_to_first_token_seconds_count{model_name="m",worker_id="0"} 5
+vllm:request_queue_time_seconds_sum{model_name="m",worker_id="0"} 2.5
+vllm:request_queue_time_seconds_count{model_name="m",worker_id="0"} 5
+vllm:request_inference_time_seconds_sum{model_name="m",worker_id="0"} 5
+vllm:request_inference_time_seconds_count{model_name="m",worker_id="0"} 5
+vllm:request_prefill_time_seconds_sum{model_name="m",worker_id="0"} 1
+vllm:request_prefill_time_seconds_count{model_name="m",worker_id="0"} 5
+vllm:request_decode_time_seconds_sum{model_name="m",worker_id="0"} 4
+vllm:request_decode_time_seconds_count{model_name="m",worker_id="0"} 5
 vllm:request_time_per_output_token_seconds_sum{model_name="m",worker_id="0"} 1
 vllm:request_time_per_output_token_seconds_count{model_name="m",worker_id="0"} 5
+vllm:request_generation_tokens_sum{model_name="m",worker_id="0"} 200
+vllm:request_generation_tokens_count{model_name="m",worker_id="0"} 5
 vllm:prompt_tokens_total{model_name="m",worker_id="0"} 100
 vllm:generation_tokens_total{model_name="m",worker_id="0"} 200
 vllm:prefix_cache_hits_total{model_name="m",worker_id="0"} 40
 vllm:prefix_cache_queries_total{model_name="m",worker_id="0"} 50
 vllm:external_prefix_cache_hits_total{model_name="m",worker_id="0"} 10
 vllm:external_prefix_cache_queries_total{model_name="m",worker_id="0"} 25
+ucm:interval_lookup_hit_rates_sum{model_name="m",worker_id="0"} 4
+ucm:interval_lookup_hit_rates_count{model_name="m",worker_id="0"} 5
 ucm:cache_load_backend_shards_total{model_name="m",worker_id="0"} 6
 ucm:cache_load_shards_total{model_name="m",worker_id="0"} 10
 """
@@ -1155,14 +1404,26 @@ vllm:e2e_request_latency_seconds_sum{model_name="other",worker_id="0"} 2000
 vllm:e2e_request_latency_seconds_count{model_name="other",worker_id="0"} 200
 vllm:time_to_first_token_seconds_sum{model_name="m",worker_id="0"} 3.2
 vllm:time_to_first_token_seconds_count{model_name="m",worker_id="0"} 9
+vllm:request_queue_time_seconds_sum{model_name="m",worker_id="0"} 4.5
+vllm:request_queue_time_seconds_count{model_name="m",worker_id="0"} 9
+vllm:request_inference_time_seconds_sum{model_name="m",worker_id="0"} 9
+vllm:request_inference_time_seconds_count{model_name="m",worker_id="0"} 9
+vllm:request_prefill_time_seconds_sum{model_name="m",worker_id="0"} 1.8
+vllm:request_prefill_time_seconds_count{model_name="m",worker_id="0"} 9
+vllm:request_decode_time_seconds_sum{model_name="m",worker_id="0"} 7.2
+vllm:request_decode_time_seconds_count{model_name="m",worker_id="0"} 9
 vllm:request_time_per_output_token_seconds_sum{model_name="m",worker_id="0"} 1.8
 vllm:request_time_per_output_token_seconds_count{model_name="m",worker_id="0"} 9
+vllm:request_generation_tokens_sum{model_name="m",worker_id="0"} 300
+vllm:request_generation_tokens_count{model_name="m",worker_id="0"} 9
 vllm:prompt_tokens_total{model_name="m",worker_id="0"} 160
 vllm:generation_tokens_total{model_name="m",worker_id="0"} 300
 vllm:prefix_cache_hits_total{model_name="m",worker_id="0"} 70
 vllm:prefix_cache_queries_total{model_name="m",worker_id="0"} 100
 vllm:external_prefix_cache_hits_total{model_name="m",worker_id="0"} 20
 vllm:external_prefix_cache_queries_total{model_name="m",worker_id="0"} 50
+ucm:interval_lookup_hit_rates_sum{model_name="m",worker_id="0"} 7.2
+ucm:interval_lookup_hit_rates_count{model_name="m",worker_id="0"} 9
 ucm:cache_load_backend_shards_total{model_name="m",worker_id="0"} 16
 ucm:cache_load_shards_total{model_name="m",worker_id="0"} 30
 """
@@ -1172,6 +1433,81 @@ ucm:cache_load_shards_total{model_name="m",worker_id="0"} 30
 def assert_close(actual: float, expected: float, name: str) -> None:
     if abs(actual - expected) > 1e-9:
         raise AssertionError(f"{name}: expected {expected}, got {actual}")
+
+
+def load_analyze_metrics_module():
+    module_path = Path(__file__).with_name("analyze_metrics.py")
+    if not module_path.exists():
+        raise FileNotFoundError(f"analyze_metrics.py not found: {module_path}")
+
+    spec = importlib.util.spec_from_file_location("metrics_lite_analyze_metrics", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to load module spec: {module_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def assert_optional_close(
+    actual: Optional[float],
+    expected: Optional[float],
+    name: str,
+) -> None:
+    if actual is None and expected is None:
+        return
+    if actual is None or expected is None:
+        raise AssertionError(f"{name}: expected {expected}, got {actual}")
+    assert_close(actual, expected, name)
+
+
+def compare_cumulative_summary_with_analyze_metrics(metrics_text: str) -> None:
+    analyze_metrics = load_analyze_metrics_module()
+
+    analyze_data, _ = analyze_metrics.parse_prometheus_metrics(metrics_text)
+    analyze_averages = analyze_metrics.compute_averages(analyze_data)
+    analyze_tps = analyze_metrics.compute_throughput(analyze_data)
+    analyze_cache = analyze_metrics.compute_cache_hit_rates(analyze_data)
+
+    samples = parse_selected_samples(
+        text=metrics_text,
+        wanted_names=required_metric_names(),
+        filters=LabelFilters(exact={}, regex={}),
+    )
+    lite_summary = compute_current_process_summary(aggregate_samples(samples))
+
+    assert lite_summary["total_requests"] == int(
+        analyze_data.get("time_to_first_token_seconds", {}).get("count", 0)
+    )
+    assert lite_summary["total_generated_tokens"] == int(
+        analyze_data.get("request_generation_tokens", {}).get("sum", 0)
+    )
+
+    lite_averages = lite_summary["averages"]
+    assert isinstance(lite_averages, dict)
+    for key, expected in analyze_averages.items():
+        assert_optional_close(lite_averages.get(key), expected, f"average:{key}")
+
+    lite_tps = lite_summary["throughput"]
+    assert isinstance(lite_tps, dict)
+    for key, expected in analyze_tps.items():
+        assert_optional_close(lite_tps.get(key), expected, f"throughput:{key}")
+
+    lite_cache = lite_summary["cache_hit_rates"]
+    assert isinstance(lite_cache, dict)
+    cache_key_map = {
+        "vLLM Prefix Cache Hit Rate": "vLLM Prefix Cache Hit Rate",
+        "vLLM External Prefix Cache Hit Rate": "vLLM External Prefix Cache Hit Rate",
+        "UCM Interval Lookup Hit Rate": "UCM Interval Lookup Hit Rate",
+        "UCM Cache Load Backend Ratio (POSIX Load)": "Posix Store Load Fraction",
+        "UCM Cache Hit Rate (in cache)": "Cache Store Load Hit Fraction",
+    }
+    for analyze_key, lite_key in cache_key_map.items():
+        assert_optional_close(
+            lite_cache.get(lite_key),
+            analyze_cache.get(analyze_key),
+            f"cache:{analyze_key}",
+        )
 
 
 def run_self_test() -> None:
@@ -1228,6 +1564,40 @@ def run_self_test() -> None:
         }
         for metric, expected_value in expected.items():
             assert_close(float(rows[metric]["value"]), expected_value, metric)
+
+        compare_cumulative_summary_with_analyze_metrics(self_test_texts()[-1])
+
+        summary_args = argparse.Namespace(
+            out=tmp,
+            interval=10.0,
+            duration=0.0,
+            timeout=10,
+            labels_contains=None,
+            model_name="m",
+            job_regex=None,
+            worker_id_regex=None,
+            instance_regex=None,
+            label=[],
+            url=None,
+            replay_files=[],
+            stop_file=None,
+            once=False,
+            continue_on_error=False,
+            plot=False,
+            plot_only=None,
+            summary=True,
+        )
+        summary_samples = parse_selected_samples(
+            text=self_test_texts()[-1],
+            wanted_names=required_metric_names(),
+            filters=build_label_filters(summary_args),
+        )
+        summary = compute_current_process_summary(aggregate_samples(summary_samples))
+        assert_close(
+            float(summary["total_requests"]),
+            9.0,
+            "summary:total_requests",
+        )
 
         timeseries_path = Path(tmp) / "timeseries.csv"
         with timeseries_path.open("r", encoding="utf-8", newline="") as f:
@@ -1356,6 +1726,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="OUT_DIR",
         help="generate plots from an existing output directory and exit",
     )
+    parser.add_argument(
+        "--summary",
+        action="store_true",
+        help="scrape once and print only the current process cumulative summary",
+    )
     return parser
 
 
@@ -1369,6 +1744,10 @@ def main() -> None:
 
     if args.plot_only:
         generate_plots(Path(args.plot_only))
+        return
+
+    if args.summary:
+        run_summary(args)
         return
 
     print("[INFO] lightweight metrics collector starting")
