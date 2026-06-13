@@ -102,18 +102,18 @@ RATIO_SPECS: List[Tuple[str, str, str, Optional[float], str]] = [
         "delta(hits) / delta(queries), equivalent to rate(hits) / rate(queries)",
     ),
     (
-        "cache_backend_load_ratio",
+        "posix_store_load_ratio",
         "ucm:cache_load_backend_shards_total",
         "ucm:cache_load_shards_total",
         1.0,
-        "rate(cache_load_backend_shards_total) / clamp_min(rate(cache_load_shards_total), 1)",
+        "rate(cache_load_backend_shards_total) / clamp_min(rate(cache_load_shards_total), 1); shards that missed Cache Store and loaded from Posix/backend",
     ),
     (
-        "cache_backend_load_fraction",
+        "posix_store_load_fraction",
         "ucm:cache_load_backend_shards_total",
         "ucm:cache_load_shards_total",
         None,
-        "delta(cache_load_backend_shards_total) / delta(cache_load_shards_total)",
+        "delta(cache_load_backend_shards_total) / delta(cache_load_shards_total); shards that missed Cache Store and loaded from Posix/backend",
     ),
 ]
 
@@ -122,21 +122,39 @@ DERIVED_COLUMNS = (
     [name for name, _, _ in HISTOGRAM_AVG_SPECS]
     + [name for name, _, _, _ in COUNTER_RATE_SPECS]
     + [name for name, _, _, _, _ in RATIO_SPECS]
-    + ["cache_store_load_fraction"]
+    + ["cache_store_load_hit_fraction"]
 )
 
 
 PLOT_GROUPS: List[Tuple[str, List[str], str, str]] = [
     (
-        "latency_averages",
-        ["e2e_request_latency_avg_s", "ttft_avg_s", "tpot_avg_s"],
-        "Latency Averages",
+        "e2e_request_latency_avg",
+        ["e2e_request_latency_avg_s"],
+        "E2E Request Latency Avg",
         "seconds",
     ),
     (
-        "token_throughput",
-        ["prompt_tokens_per_s", "generation_tokens_per_s"],
-        "Token Throughput",
+        "ttft_avg",
+        ["ttft_avg_s"],
+        "TTFT Avg",
+        "seconds",
+    ),
+    (
+        "tpot_avg",
+        ["tpot_avg_s"],
+        "TPOT Avg",
+        "seconds",
+    ),
+    (
+        "prompt_token_throughput",
+        ["prompt_tokens_per_s"],
+        "Prompt Token Throughput",
+        "tokens/s",
+    ),
+    (
+        "generation_token_throughput",
+        ["generation_tokens_per_s"],
+        "Generation Token Throughput",
         "tokens/s",
     ),
     (
@@ -146,9 +164,9 @@ PLOT_GROUPS: List[Tuple[str, List[str], str, str]] = [
         "ratio",
     ),
     (
-        "cache_backend_load",
-        ["cache_backend_load_ratio", "cache_backend_load_fraction", "cache_store_load_fraction"],
-        "Cache Backend Load",
+        "cache_store_vs_posix_store_load",
+        ["posix_store_load_ratio", "posix_store_load_fraction", "cache_store_load_hit_fraction"],
+        "Cache Store vs Posix Store Load Source",
         "ratio",
     ),
 ]
@@ -423,7 +441,7 @@ def compute_interval_row(
             summary.add_counter(output_name, delta, interval_seconds)
         row[output_name] = format_optional(value)
 
-    backend_fraction: Optional[float] = None
+    posix_fraction: Optional[float] = None
     for output_name, numerator, denominator, clamp_min, _ in RATIO_SPECS:
         delta_num = delta_value(previous, current, numerator)
         delta_den = delta_value(previous, current, denominator)
@@ -432,21 +450,21 @@ def compute_interval_row(
             value = ratio_from_deltas(delta_num, delta_den, interval_seconds, clamp_min)
             if value is not None:
                 summary.add_ratio(output_name, delta_num, delta_den, interval_seconds)
-        if output_name == "cache_backend_load_fraction":
-            backend_fraction = value
+        if output_name == "posix_store_load_fraction":
+            posix_fraction = value
         row[output_name] = format_optional(value)
 
     store_fraction = None
-    if backend_fraction is not None:
-        store_fraction = max(0.0, min(1.0, 1.0 - backend_fraction))
+    if posix_fraction is not None:
+        store_fraction = max(0.0, min(1.0, 1.0 - posix_fraction))
         summary.add_ratio(
-            "cache_store_load_fraction",
+            "cache_store_load_hit_fraction",
             max(0.0, (delta_value(previous, current, "ucm:cache_load_shards_total") or 0.0)
                 - (delta_value(previous, current, "ucm:cache_load_backend_shards_total") or 0.0)),
             delta_value(previous, current, "ucm:cache_load_shards_total") or 0.0,
             interval_seconds,
         )
-    row["cache_store_load_fraction"] = format_optional(store_fraction)
+    row["cache_store_load_hit_fraction"] = format_optional(store_fraction)
 
     return row
 
@@ -486,7 +504,7 @@ def write_manifest(out_dir: Path, args: argparse.Namespace, wanted_names: Sequen
             for name, numerator, denominator, clamp_min, method in RATIO_SPECS
         ],
         "derived_metrics": {
-            "cache_store_load_fraction": "1 - cache_backend_load_fraction, clamped to [0, 1]",
+            "cache_store_load_hit_fraction": "1 - posix_store_load_fraction, clamped to [0, 1]; shards served by Cache Store without loading from Posix/backend",
         },
         "options": {
             "url": getattr(args, "url", None),
@@ -575,7 +593,7 @@ def write_summary(out_dir: Path, summary: SummaryAccumulator) -> None:
                 }
             )
 
-        name = "cache_store_load_fraction"
+        name = "cache_store_load_hit_fraction"
         numerator = summary.ratio_num.get(name, 0.0)
         denominator = summary.ratio_den.get(name, 0.0)
         writer.writerow(
@@ -583,7 +601,7 @@ def write_summary(out_dir: Path, summary: SummaryAccumulator) -> None:
                 "metric": name,
                 "value": format_optional(safe_div(numerator, denominator)),
                 "unit": "ratio",
-                "method": "delta(cache_load_shards_total - cache_load_backend_shards_total) / delta(cache_load_shards_total)",
+                "method": "delta(cache_load_shards_total - cache_load_backend_shards_total) / delta(cache_load_shards_total); shards served by Cache Store without loading from Posix/backend",
                 "valid_intervals": summary.valid_intervals.get(name, 0),
                 "numerator_delta": format_optional(numerator),
                 "denominator_delta": format_optional(denominator),
@@ -604,23 +622,37 @@ def parse_float_cell(value: str) -> Optional[float]:
     return parsed
 
 
-def read_timeseries(path: Path) -> List[Dict[str, Optional[float]]]:
-    rows: List[Dict[str, Optional[float]]] = []
+def read_timeseries(path: Path) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
     with path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for raw_row in reader:
-            row: Dict[str, Optional[float]] = {}
+            row: Dict[str, object] = {}
             for key, value in raw_row.items():
                 if key in ("datetime",):
+                    row[key] = value
                     continue
                 row[key] = parse_float_cell(value)
             rows.append(row)
     return rows
 
 
+def row_float(row: Dict[str, object], key: str) -> Optional[float]:
+    value = row.get(key)
+    if isinstance(value, float):
+        return value
+    if isinstance(value, int):
+        return float(value)
+    return None
+
+
+def format_time_label(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def write_svg_plot(
     out_path: Path,
-    rows: List[Dict[str, Optional[float]]],
+    rows: List[Dict[str, object]],
     columns: List[str],
     title: str,
     ylabel: str,
@@ -628,7 +660,7 @@ def write_svg_plot(
     from xml.sax.saxutils import escape
 
     x_values = [
-        (row.get("elapsed_seconds") or 0.0) / 60.0
+        row_float(row, "timestamp") or row_float(row, "elapsed_seconds") or 0.0
         for row in rows
     ]
     series: List[Tuple[str, List[Tuple[float, float]]]] = []
@@ -636,9 +668,9 @@ def write_svg_plot(
 
     for column in columns:
         points = [
-            (x, row.get(column))
+            (x, row_float(row, column))
             for x, row in zip(x_values, rows)
-            if row.get(column) is not None
+            if row_float(row, column) is not None
         ]
         clean_points = [(x, y) for x, y in points if y is not None]
         if clean_points:
@@ -653,7 +685,7 @@ def write_svg_plot(
     left = 86
     right = 24
     top = 54
-    bottom = 74
+    bottom = 112
     plot_width = width - left - right
     plot_height = height - top - bottom
 
@@ -682,7 +714,7 @@ def write_svg_plot(
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="white"/>',
         f'<text x="{width / 2}" y="28" text-anchor="middle" font-family="Arial" font-size="20" fill="#111827">{escape(title)}</text>',
-        f'<text x="{width / 2}" y="{height - 18}" text-anchor="middle" font-family="Arial" font-size="13" fill="#374151">Elapsed Time (min)</text>',
+        f'<text x="{width / 2}" y="{height - 18}" text-anchor="middle" font-family="Arial" font-size="13" fill="#374151">Time</text>',
         f'<text x="18" y="{height / 2}" text-anchor="middle" font-family="Arial" font-size="13" fill="#374151" transform="rotate(-90 18 {height / 2})">{escape(ylabel)}</text>',
         f'<line x1="{left}" y1="{top + plot_height}" x2="{left + plot_width}" y2="{top + plot_height}" stroke="#374151" stroke-width="1"/>',
         f'<line x1="{left}" y1="{top}" x2="{left}" y2="{top + plot_height}" stroke="#374151" stroke-width="1"/>',
@@ -697,10 +729,11 @@ def write_svg_plot(
     for i in range(6):
         x = left + i * plot_width / 5
         value = x_min + i * (x_max - x_min) / 5
-        parts.append(f'<text x="{x:.2f}" y="{top + plot_height + 18}" text-anchor="middle" font-family="Arial" font-size="11" fill="#4b5563">{value:.4g}</text>')
+        label = format_time_label(value)
+        parts.append(f'<text x="{x:.2f}" y="{top + plot_height + 18}" text-anchor="end" font-family="Arial" font-size="10" fill="#4b5563" transform="rotate(-30 {x:.2f} {top + plot_height + 18})">{escape(label)}</text>')
 
     legend_x = left
-    legend_y = height - 46
+    legend_y = height - 34
     for idx, (name, points) in enumerate(series):
         color = colors[idx % len(colors)]
         polyline = " ".join(f"{sx(x):.2f},{sy(y):.2f}" for x, y in points)
@@ -728,11 +761,13 @@ def generate_plots(out_dir: Path) -> None:
         return
 
     plt = None
+    mdates = None
     try:
         import matplotlib
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
     except Exception as exc:
         print(f"[WARN] matplotlib is not available; generating SVG plots instead: {exc}")
 
@@ -740,9 +775,10 @@ def generate_plots(out_dir: Path) -> None:
     plot_dir.mkdir(parents=True, exist_ok=True)
 
     x_values = [
-        (row.get("elapsed_seconds") or 0.0) / 60.0
+        row_float(row, "timestamp") or row_float(row, "elapsed_seconds") or 0.0
         for row in rows
     ]
+    x_datetimes = [datetime.fromtimestamp(x) for x in x_values]
 
     generated = 0
     for filename, columns, title, ylabel in PLOT_GROUPS:
@@ -757,9 +793,9 @@ def generate_plots(out_dir: Path) -> None:
         plt.figure(figsize=(12, 6))
         for column in columns:
             points = [
-                (x, row.get(column))
-                for x, row in zip(x_values, rows)
-                if row.get(column) is not None
+                (x, row_float(row, column))
+                for x, row in zip(x_datetimes, rows)
+                if row_float(row, column) is not None
             ]
             if not points:
                 continue
@@ -773,11 +809,15 @@ def generate_plots(out_dir: Path) -> None:
             print(f"[WARN] no valid data for plot: {title}")
             continue
 
-        plt.xlabel("Elapsed Time (min)")
+        ax = plt.gca()
+        if mdates is not None:
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d %H:%M:%S"))
+        plt.xlabel("Time")
         plt.ylabel(ylabel)
         plt.title(title)
         plt.grid(True, alpha=0.3)
         plt.legend()
+        plt.gcf().autofmt_xdate(rotation=30, ha="right")
         plt.tight_layout()
         out_path = plot_dir / f"{filename}.png"
         plt.savefig(out_path, dpi=160)
@@ -1146,9 +1186,9 @@ def run_self_test() -> None:
             "generation_tokens_per_s": 10.0,
             "prefix_cache_hit_rate": 0.6,
             "external_prefix_cache_hit_rate": 0.4,
-            "cache_backend_load_ratio": 0.5,
-            "cache_backend_load_fraction": 0.5,
-            "cache_store_load_fraction": 0.5,
+            "posix_store_load_ratio": 0.5,
+            "posix_store_load_fraction": 0.5,
+            "cache_store_load_hit_fraction": 0.5,
         }
         for metric, expected_value in expected.items():
             assert_close(float(rows[metric]["value"]), expected_value, metric)
@@ -1160,10 +1200,13 @@ def run_self_test() -> None:
             raise AssertionError(f"expected 1 interval row, got {len(timeseries_rows)}")
         plot_dir = Path(tmp) / "plots"
         expected_plots = [
-            "latency_averages",
-            "token_throughput",
+            "e2e_request_latency_avg",
+            "ttft_avg",
+            "tpot_avg",
+            "prompt_token_throughput",
+            "generation_token_throughput",
             "cache_hit_rates",
-            "cache_backend_load",
+            "cache_store_vs_posix_store_load",
         ]
         missing_plots = [
             name
