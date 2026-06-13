@@ -17,6 +17,7 @@ Outputs:
   - raw_selected_samples.csv.gz: only raw samples used by formulas.
   - scrape_meta.csv: request timing, size, and parse status.
   - manifest.json: formulas and collection options.
+  - plots/: optional PNG charts generated after collection.
 
 Example:
   python metrics_lite.py \
@@ -44,7 +45,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 
 VLLM_METRIC_PREFIX = "vllm:"
@@ -123,6 +124,34 @@ DERIVED_COLUMNS = (
     + [name for name, _, _, _, _ in RATIO_SPECS]
     + ["cache_store_load_fraction"]
 )
+
+
+PLOT_GROUPS: List[Tuple[str, List[str], str, str]] = [
+    (
+        "latency_averages",
+        ["e2e_request_latency_avg_s", "ttft_avg_s", "tpot_avg_s"],
+        "Latency Averages",
+        "seconds",
+    ),
+    (
+        "token_throughput",
+        ["prompt_tokens_per_s", "generation_tokens_per_s"],
+        "Token Throughput",
+        "tokens/s",
+    ),
+    (
+        "cache_hit_rates",
+        ["prefix_cache_hit_rate", "external_prefix_cache_hit_rate"],
+        "Prefix Cache Hit Rates",
+        "ratio",
+    ),
+    (
+        "cache_backend_load",
+        ["cache_backend_load_ratio", "cache_backend_load_fraction", "cache_store_load_fraction"],
+        "Cache Backend Load",
+        "ratio",
+    ),
+]
 
 
 STOP_REQUESTED = False
@@ -563,6 +592,201 @@ def write_summary(out_dir: Path, summary: SummaryAccumulator) -> None:
         )
 
 
+def parse_float_cell(value: str) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = float(value)
+    except ValueError:
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def read_timeseries(path: Path) -> List[Dict[str, Optional[float]]]:
+    rows: List[Dict[str, Optional[float]]] = []
+    with path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for raw_row in reader:
+            row: Dict[str, Optional[float]] = {}
+            for key, value in raw_row.items():
+                if key in ("datetime",):
+                    continue
+                row[key] = parse_float_cell(value)
+            rows.append(row)
+    return rows
+
+
+def write_svg_plot(
+    out_path: Path,
+    rows: List[Dict[str, Optional[float]]],
+    columns: List[str],
+    title: str,
+    ylabel: str,
+) -> bool:
+    from xml.sax.saxutils import escape
+
+    x_values = [
+        (row.get("elapsed_seconds") or 0.0) / 60.0
+        for row in rows
+    ]
+    series: List[Tuple[str, List[Tuple[float, float]]]] = []
+    y_values: List[float] = []
+
+    for column in columns:
+        points = [
+            (x, row.get(column))
+            for x, row in zip(x_values, rows)
+            if row.get(column) is not None
+        ]
+        clean_points = [(x, y) for x, y in points if y is not None]
+        if clean_points:
+            series.append((column, clean_points))
+            y_values.extend(y for _, y in clean_points)
+
+    if not series or not y_values:
+        return False
+
+    width = 1000
+    height = 520
+    left = 86
+    right = 24
+    top = 54
+    bottom = 74
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+
+    x_min = min(x_values)
+    x_max = max(x_values)
+    if x_min == x_max:
+        x_min -= 0.5
+        x_max += 0.5
+
+    y_min = min(0.0, min(y_values))
+    y_max = max(y_values)
+    if y_min == y_max:
+        y_min -= 0.5
+        y_max += 0.5
+    elif y_max <= 1.0 and y_min >= 0.0:
+        y_max = 1.0
+
+    def sx(x: float) -> float:
+        return left + (x - x_min) / (x_max - x_min) * plot_width
+
+    def sy(y: float) -> float:
+        return top + (y_max - y) / (y_max - y_min) * plot_height
+
+    colors = ["#2563eb", "#dc2626", "#16a34a", "#9333ea", "#ea580c", "#0891b2"]
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="white"/>',
+        f'<text x="{width / 2}" y="28" text-anchor="middle" font-family="Arial" font-size="20" fill="#111827">{escape(title)}</text>',
+        f'<text x="{width / 2}" y="{height - 18}" text-anchor="middle" font-family="Arial" font-size="13" fill="#374151">Elapsed Time (min)</text>',
+        f'<text x="18" y="{height / 2}" text-anchor="middle" font-family="Arial" font-size="13" fill="#374151" transform="rotate(-90 18 {height / 2})">{escape(ylabel)}</text>',
+        f'<line x1="{left}" y1="{top + plot_height}" x2="{left + plot_width}" y2="{top + plot_height}" stroke="#374151" stroke-width="1"/>',
+        f'<line x1="{left}" y1="{top}" x2="{left}" y2="{top + plot_height}" stroke="#374151" stroke-width="1"/>',
+    ]
+
+    for i in range(6):
+        y = top + i * plot_height / 5
+        value = y_max - i * (y_max - y_min) / 5
+        parts.append(f'<line x1="{left}" y1="{y:.2f}" x2="{left + plot_width}" y2="{y:.2f}" stroke="#e5e7eb" stroke-width="1"/>')
+        parts.append(f'<text x="{left - 8}" y="{y + 4:.2f}" text-anchor="end" font-family="Arial" font-size="11" fill="#4b5563">{value:.4g}</text>')
+
+    for i in range(6):
+        x = left + i * plot_width / 5
+        value = x_min + i * (x_max - x_min) / 5
+        parts.append(f'<text x="{x:.2f}" y="{top + plot_height + 18}" text-anchor="middle" font-family="Arial" font-size="11" fill="#4b5563">{value:.4g}</text>')
+
+    legend_x = left
+    legend_y = height - 46
+    for idx, (name, points) in enumerate(series):
+        color = colors[idx % len(colors)]
+        polyline = " ".join(f"{sx(x):.2f},{sy(y):.2f}" for x, y in points)
+        parts.append(f'<polyline points="{polyline}" fill="none" stroke="{color}" stroke-width="2"/>')
+        for x, y in points:
+            parts.append(f'<circle cx="{sx(x):.2f}" cy="{sy(y):.2f}" r="3" fill="{color}"/>')
+        lx = legend_x + (idx % 2) * 420
+        ly = legend_y + (idx // 2) * 18
+        parts.append(f'<rect x="{lx}" y="{ly - 10}" width="12" height="12" fill="{color}"/>')
+        parts.append(f'<text x="{lx + 18}" y="{ly}" font-family="Arial" font-size="12" fill="#111827">{escape(name)}</text>')
+
+    parts.append("</svg>")
+    out_path.write_text("\n".join(parts) + "\n", encoding="utf-8")
+    return True
+
+
+def generate_plots(out_dir: Path) -> None:
+    timeseries_path = out_dir / "timeseries.csv"
+    if not timeseries_path.exists():
+        raise FileNotFoundError(f"timeseries file not found: {timeseries_path}")
+
+    rows = read_timeseries(timeseries_path)
+    if not rows:
+        print(f"[WARN] no interval rows in {timeseries_path}; no plots generated")
+        return
+
+    plt = None
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"[WARN] matplotlib is not available; generating SVG plots instead: {exc}")
+
+    plot_dir = out_dir / "plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+
+    x_values = [
+        (row.get("elapsed_seconds") or 0.0) / 60.0
+        for row in rows
+    ]
+
+    generated = 0
+    for filename, columns, title, ylabel in PLOT_GROUPS:
+        if plt is None:
+            if write_svg_plot(plot_dir / f"{filename}.svg", rows, columns, title, ylabel):
+                generated += 1
+            else:
+                print(f"[WARN] no valid data for plot: {title}")
+            continue
+
+        has_series = False
+        plt.figure(figsize=(12, 6))
+        for column in columns:
+            points = [
+                (x, row.get(column))
+                for x, row in zip(x_values, rows)
+                if row.get(column) is not None
+            ]
+            if not points:
+                continue
+
+            xs, ys = zip(*points)
+            plt.plot(xs, ys, marker="o", linewidth=1.5, markersize=3, label=column)
+            has_series = True
+
+        if not has_series:
+            plt.close()
+            print(f"[WARN] no valid data for plot: {title}")
+            continue
+
+        plt.xlabel("Elapsed Time (min)")
+        plt.ylabel(ylabel)
+        plt.title(title)
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        out_path = plot_dir / f"{filename}.png"
+        plt.savefig(out_path, dpi=160)
+        plt.close()
+        generated += 1
+
+    print(f"[INFO] generated {generated} plot(s) in: {plot_dir}")
+
+
 def scrape_http_once(url: str, timeout: int) -> ScrapeResult:
     started = time.time()
     try:
@@ -782,6 +1006,9 @@ def collect_from_scrapes(
 
     write_summary(out_dir, summary)
 
+    if args.plot:
+        generate_plots(out_dir)
+
     print(f"[INFO] timeseries saved to: {timeseries_path}")
     print(f"[INFO] summary saved to: {out_dir / 'summary.csv'}")
     print(f"[INFO] selected raw samples saved to: {raw_path}")
@@ -889,6 +1116,8 @@ def run_self_test() -> None:
             stop_file=None,
             once=False,
             continue_on_error=False,
+            plot=True,
+            plot_only=None,
         )
 
         start = time.time()
@@ -929,6 +1158,21 @@ def run_self_test() -> None:
             timeseries_rows = list(csv.DictReader(f))
         if len(timeseries_rows) != 1:
             raise AssertionError(f"expected 1 interval row, got {len(timeseries_rows)}")
+        plot_dir = Path(tmp) / "plots"
+        expected_plots = [
+            "latency_averages",
+            "token_throughput",
+            "cache_hit_rates",
+            "cache_backend_load",
+        ]
+        missing_plots = [
+            name
+            for name in expected_plots
+            if not (plot_dir / f"{name}.png").exists()
+            and not (plot_dir / f"{name}.svg").exists()
+        ]
+        if missing_plots:
+            raise AssertionError(f"missing expected plot(s): {', '.join(missing_plots)}")
 
     print("[INFO] self-test passed")
 
@@ -1022,6 +1266,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="run built-in formula checks with simulated metrics",
     )
+    parser.add_argument(
+        "--plot",
+        action="store_true",
+        help="generate PNG plots from timeseries.csv after collection",
+    )
+    parser.add_argument(
+        "--plot-only",
+        default=None,
+        metavar="OUT_DIR",
+        help="generate plots from an existing output directory and exit",
+    )
     return parser
 
 
@@ -1031,6 +1286,10 @@ def main() -> None:
 
     if args.self_test:
         run_self_test()
+        return
+
+    if args.plot_only:
+        generate_plots(Path(args.plot_only))
         return
 
     print("[INFO] lightweight metrics collector starting")
