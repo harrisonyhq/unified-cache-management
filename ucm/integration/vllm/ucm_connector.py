@@ -34,7 +34,11 @@ from vllm.platforms import current_platform
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import KVConnectorOutput
 
-from ucm.integration.vllm.device import create_device, get_current_device_id
+from ucm.integration.vllm.device import (
+    create_device,
+    get_current_device_id,
+    get_ucm_worker_torch_device,
+)
 from ucm.integration.vllm.metrics import (
     UCM_HAS_PROM_METRICS,
     UCMConnectorStats,
@@ -1121,19 +1125,8 @@ class UCMDirectConnector(KVConnectorBase_V1):
         )
         self._kv_cache_config = kv_cache_config
 
-        if current_platform.is_cuda_alike():
-            logger.info("CUDA device is available.")
-            torch_dev = torch
-            dev_name = "cuda"
-        elif current_platform.device_type == "npu":
-            logger.info("NPU device is available.")
-            torch_dev = torch.npu
-            dev_name = "npu"
-        else:
-            raise RuntimeError("Unsupported device platform for UCMDirectConnector.")
-
         if self.device_id >= 0:
-            self.device = torch_dev.device(f"{dev_name}:{self.device_id}")
+            self.device = get_ucm_worker_torch_device(self.device_id)
 
         self.store: UcmKVStoreBaseV1
         self.rope_store: Optional[UcmKVStoreBaseV1] = None
