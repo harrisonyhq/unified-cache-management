@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 import yaml
@@ -25,6 +25,11 @@ class ECConfigTest(unittest.TestCase):
             model_config=SimpleNamespace(
                 model="org/model",
                 dtype=torch.bfloat16,
+                hf_config=None,
+                multimodal_config=None,
+                revision=None,
+                code_revision=None,
+                tokenizer_revision=None,
                 get_inputs_embeds_size=lambda: 5120,
             ),
             parallel_config=SimpleNamespace(
@@ -107,16 +112,88 @@ class ECConfigTest(unittest.TestCase):
             with self.subTest(rows=rows), self.assertRaises(ec.EncoderCacheLayoutError):
                 self.layout({"chunk_size": rows})
 
-    def test_width_override_must_match_model(self):
-        with self.assertRaises(ec.EncoderCacheLayoutError):
-            self.layout({"chunk_size": 128, "encoder_cache_hidden_dim": 4096})
+    def test_explicit_ec_width_does_not_require_generic_input_width(self):
+        model = self.vllm_config.model_config
+        model.get_inputs_embeds_size = Mock(side_effect=AssertionError("not needed"))
+        layout = self.layout({"chunk_size": 128, "encoder_cache_hidden_dim": 4096})
+        self.assertEqual(layout.width, 4096)
+        self.assertEqual(layout.chunk_bytes, 128 * 4096 * 2)
+        model.get_inputs_embeds_size.assert_not_called()
+
+    def test_deepstack_width_uses_structure_independently_of_model_name(self):
+        model = self.vllm_config.model_config
+        model.hf_config = SimpleNamespace(vision_config=SimpleNamespace(
+            out_hidden_size=1024, deepstack_visual_indexes=[1, 3, 5],
+        ))
+        model.get_inputs_embeds_size = Mock(side_effect=AssertionError("not needed"))
+        for name in ("org/renamed-model", "/local/checkpoint"):
+            with self.subTest(name=name):
+                model.model = name
+                self.assertEqual(self.layout().width, 4096)
+
+    def test_empty_deepstack_uses_output_width(self):
+        self.vllm_config.model_config.hf_config = SimpleNamespace(
+            vision_config=SimpleNamespace(
+                out_hidden_size=1024, deepstack_visual_indexes=[],
+            ),
+        )
+        self.assertEqual(self.layout().width, 1024)
+
+    def test_incomplete_vision_layout_uses_vllm_input_width(self):
+        self.vllm_config.model_config.hf_config = SimpleNamespace(
+            vision_config=SimpleNamespace(out_hidden_size=1024),
+        )
+        self.assertEqual(self.layout().width, 5120)
+
+    def test_nonpositive_explicit_width_is_rejected(self):
+        for width in (0, -1):
+            with (
+                self.subTest(width=width),
+                self.assertRaises(ec.EncoderCacheLayoutError),
+            ):
+                self.layout({"chunk_size": 128, "encoder_cache_hidden_dim": width})
 
     def test_pruning_is_rejected_without_an_enable_switch(self):
         self.vllm_config.model_config.multimodal_config = SimpleNamespace(
             is_multimodal_pruning_enabled=lambda: True,
         )
-        with self.assertRaises(ec.EncoderCacheLayoutError):
-            self.layout()
+        with (
+            patch.object(ec.ECConnectorBase, "__init__", return_value=None),
+            patch.object(ec, "create_ucm_ec_store") as create_store,
+            self.assertRaises(ec.EncoderCacheLayoutError),
+        ):
+            ec.UCMECConnector(self.vllm_config, ec.ECConnectorRole.SCHEDULER)
+        create_store.assert_not_called()
+
+    def test_cache_namespace_preserves_identity_hash_input(self):
+        model = self.vllm_config.model_config
+        model.revision = "weights-revision"
+        model.code_revision = "code-revision"
+        model.tokenizer_revision = "tokenizer-revision"
+        model.hf_config = SimpleNamespace(
+            _commit_hash="commit", architectures=["CustomArchitecture"],
+        )
+        model.multimodal_config = SimpleNamespace(compute_hash=lambda: "mm-hash")
+        hasher = Mock(return_value=b"namespace")
+        self.assertEqual(
+            ec.resolve_cache_namespace(self.vllm_config, {}, hasher), b"namespace"
+        )
+        hasher.assert_called_once_with((
+            "ucm-ec-namespace-v1",
+            ("inferred", (
+                "org/model", "weights-revision", "code-revision",
+                "tokenizer-revision", "commit", ("CustomArchitecture",), "mm-hash",
+            )),
+        ))
+
+    def test_explicit_namespace_bypasses_model_identity(self):
+        hasher = Mock(return_value=b"namespace")
+        ec.resolve_cache_namespace(
+            SimpleNamespace(), {"cache_namespace": "shared"}, hasher
+        )
+        hasher.assert_called_once_with((
+            "ucm-ec-namespace-v1", ("explicit", "shared"),
+        ))
 
     def test_store_overrides_do_not_mutate_yaml_and_preserve_backend_string(self):
         self.config["ucm_connector_config"].update(

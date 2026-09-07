@@ -127,23 +127,25 @@ D = vllm_config.model_config.get_inputs_embeds_size()
 ```
 
 这是 projector 后送入语言模型的 `inputs_embeds` 宽度。它不是所有模型的完整 EC
-layout API，必须增加模型特例。
+layout API；特殊布局需要明确的结构约定或显式 EC 宽度。
 
-### 5.3 已知模型规则
+### 5.3 宽度解析顺序
 
-| 模型 | 配置推导 | 默认 D |
-|---|---|---:|
-| DeepSeek-V4-Flash-Vision-Exp | `hf_config.hidden_size` | 4096 |
-| Qwen3.8-27B | `vision.out_hidden_size * (1 + len(deepstack_visual_indexes))` | 5120 |
-| Kimi-K2.7-Code | `hf_config.text_config.hidden_size` | 7168 |
+`resolve_encoder_cache_layout()` 集中解析宽度、dtype 和 chunk layout，不根据模型名称、
+路径或 architecture 名称选择配置分支：
 
-Qwen multimodal pruning 会在 EC tensor 尾部追加 5 个 mRoPE 通道：
+1. `encoder_cache_hidden_dim` 非空时，优先采用用户指定的 EC 宽度。
+2. 未显式配置且 `vision_config` 同时提供 `out_hidden_size` 和
+   `deepstack_visual_indexes` 时，按拼接布局计算
+   `D = out_hidden_size * (1 + len(deepstack_visual_indexes))`；空索引列表的倍率为 1。
+3. 其余情况使用 vLLM 的 `model_config.get_inputs_embeds_size()`。
 
-```text
-D = base_D + 5
-```
+显式宽度不再无条件与通用输入宽度比较。完整 EC 宽度可能不同于语言模型输入宽度，
+特殊布局应允许显式配置。宽度必须为正，Worker dump 仍检查真实 tensor 的 shape 和 dtype。
+结构字段推导仅适用于上述 deepstack 拼接约定，不能代替所有模型的 EC layout 接口。
 
-当前不支持该模式，启动时直接拒绝；不提供 pruning 开关。
+不支持 multimodal pruning。仅在 connector 初始化时读取 vLLM 的 multimodal 配置并
+拒绝该模式；不保留专用检测 helper、配置开关或追加宽度的适配逻辑。
 
 ### 5.4 Layout 数据结构
 
@@ -152,8 +154,6 @@ D = base_D + 5
 class EncoderCacheLayout:
     width: int
     dtype: torch.dtype
-    element_size: int
-    row_bytes: int
     rows_per_chunk: int
     chunk_bytes: int
     layout_id: bytes
@@ -327,7 +327,7 @@ pending_loads: dict[str, ECLoadSpec]
 ```
 
 `identifier` 已经是 `identifier_to_blocks` 的 key；`num_chunks` 等于
-`len(chunk_ids)`；`valid_nbytes` 可以由 `num_embeds * layout.row_bytes` 计算；
+`len(chunk_ids)`；`valid_nbytes` 可以由 `num_embeds * width * dtype.itemsize` 计算；
 `layout_id` 是 connector 级常量。因此这些字段都不在每个 identifier 中重复保存。
 
 ### 8.2 为什么需要 request ref count
@@ -981,8 +981,12 @@ ucm_ec_connector:
 
 `Config.load_ec_config()` 直接返回 YAML 的 `ucm_ec_connector` 段，不创建 KV 参数代理。
 必填字段使用下标；可选的 `encoder_cache_hidden_dim`、`cache_namespace`、
-`store_unique_id` 使用 `.get()`，未配置时自动推导。显式 width 必须与推导值一致。
+`store_unique_id` 使用 `.get()`，未配置时自动推导。显式 width 优先，实际 tensor 由 Worker 校验。
 仅在组装 Store 参数时浅拷贝一次 Store 配置，不深拷贝整个 YAML。
+
+`resolve_cache_namespace()` 直接组织模型、revision、HF commit、architecture 和 multimodal
+配置 hash，不再调用独立的模型 identity helper。显式 namespace 与自动 namespace 的
+hash 输入结构保持不变；模型名称仅用于缓存身份隔离，不参与宽度推导分支。
 
 Store 的 `share_buffer_enable` 强制为 `True`，`local_rank_size` 直接覆盖为 TP size，
 与 KV connector 的 MLA 分支一致。`use_gdr` 强制为 `False`；用户配置中出现该键时
@@ -1061,12 +1065,12 @@ has_cache_item(identifier)
 
 ### 16.1 Layout 单元测试
 
-- DeepSeek-V4-Flash-Vision-Exp：D=4096；
-- Qwen3.8-27B：D=5120；
-- Qwen deepstack：`D=out_hidden_size*(1+levels)`；
-- 模型启用 Qwen pruning 时拒绝启动；
-- Kimi-K2.7-Code：D=7168；
-- override 与推导值冲突时拒绝启动；
+- 普通布局调用 vLLM 通用输入宽度接口；
+- 相同 deepstack 结构在模型重命名后仍推导出相同宽度；
+- deepstack 索引为空时使用单份输出宽度，缺少完整结构时使用通用接口；
+- 显式 EC 宽度优先，不调用通用宽度推导；
+- 非正宽度拒绝初始化；
+- connector 初始化时拒绝 pruning，且不创建 Store；
 - 任意正整数 chunk 行数原样保留，字节数由行数、宽度和 dtype 决定。
 
 ### 16.2 Key 和 identifier state 单元测试
@@ -1142,7 +1146,7 @@ ucm_ec_tail_padding_bytes_total
 启动日志打印：
 
 ```text
-model / revision / D / dtype / row_bytes / rows_per_chunk /
+model / revision / D / dtype / rows_per_chunk /
 chunk_bytes / layout_id / cache_namespace / pipeline / dp rank / save rank
 ```
 

@@ -56,10 +56,11 @@ class UCMEncoderCacheError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class EncoderCacheLayout:
+    """EncoderCache tensor shape: [N,D]"""
+
+    # Embedding width per row in encoder cache, D.
     width: int
     dtype: torch.dtype
-    element_size: int
-    row_bytes: int
     rows_per_chunk: int
     chunk_bytes: int
     layout_id: bytes
@@ -83,108 +84,29 @@ class UCMECConnectorMetadata(ECConnectorMetadata):
     loads: dict[str, ECLoadSpec] = field(default_factory=dict)
 
 
-def _model_identity(vllm_config: VllmConfig) -> tuple[Any, ...]:
-    model_config = vllm_config.model_config
-    mm_config = getattr(model_config, "multimodal_config", None)
-    mm_hash = None
-    if mm_config is not None:
-        compute_hash = getattr(mm_config, "compute_hash", None)
-        if callable(compute_hash):
-            mm_hash = compute_hash()
-
-    hf_config = getattr(model_config, "hf_config", None)
-    return (
-        getattr(model_config, "model", None),
-        getattr(model_config, "revision", None),
-        getattr(model_config, "code_revision", None),
-        getattr(model_config, "tokenizer_revision", None),
-        getattr(hf_config, "_commit_hash", None),
-        tuple(getattr(hf_config, "architectures", None) or ()),
-        mm_hash,
-    )
-
-
-def _model_family(vllm_config: VllmConfig) -> str:
-    model_config = vllm_config.model_config
-    hf_config = getattr(model_config, "hf_config", None)
-    parts = [
-        str(getattr(model_config, "model", "")),
-        str(getattr(hf_config, "model_type", "")),
-        *[str(value) for value in (getattr(hf_config, "architectures", None) or ())],
-    ]
-    return " ".join(parts).lower().replace("-", "_")
-
-
-def _resolve_inferred_width(vllm_config: VllmConfig) -> int:
-    model_config = vllm_config.model_config
-    hf_config = getattr(model_config, "hf_config", None)
-    family = _model_family(vllm_config)
-
-    vision_config = getattr(hf_config, "vision_config", None)
-    if vision_config is not None:
-        out_hidden_size = getattr(vision_config, "out_hidden_size", None)
-        deepstack_indexes = getattr(
-            vision_config, "deepstack_visual_indexes", None
-        )
-        if out_hidden_size is not None and deepstack_indexes is not None:
-            return int(out_hidden_size) * (1 + len(deepstack_indexes))
-
-    if "deepseek_v4" in family:
-        hidden_size = getattr(hf_config, "hidden_size", None)
-        if hidden_size is not None:
-            return int(hidden_size)
-
-    if "kimi_k2" in family or "kimi_k2_7" in family:
-        text_config = getattr(hf_config, "text_config", None)
-        hidden_size = getattr(text_config, "hidden_size", None)
-        if hidden_size is not None:
-            return int(hidden_size)
-
-    return int(model_config.get_inputs_embeds_size())
-
-
-def _multimodal_pruning_enabled(vllm_config: VllmConfig) -> bool:
-    mm_config = getattr(vllm_config.model_config, "multimodal_config", None)
-    if mm_config is None:
-        return False
-    is_enabled = getattr(mm_config, "is_multimodal_pruning_enabled", None)
-    return bool(is_enabled()) if callable(is_enabled) else False
-
-
-def resolve_encoder_output_width(
-    vllm_config: VllmConfig,
-    encoder_config: dict[str, Any],
-) -> int:
-    if _multimodal_pruning_enabled(vllm_config):
-        raise EncoderCacheLayoutError("UCM EC does not support multimodal pruning.")
-    inferred_width = _resolve_inferred_width(vllm_config)
-    override = encoder_config.get("encoder_cache_hidden_dim")
-    if override is None:
-        width = inferred_width
-    else:
-        width = int(override)
-        if width != inferred_width:
-            raise EncoderCacheLayoutError(
-                "encoder_cache_hidden_dim does not match the width inferred from "
-                f"the model: override={width}, inferred={inferred_width}."
-            )
-
-    if width <= 0:
-        raise EncoderCacheLayoutError(
-            f"Encoder-cache width must be positive, got {width}."
-        )
-    return width
-
-
 def resolve_encoder_cache_layout(
     vllm_config: VllmConfig,
     encoder_config: dict[str, Any],
     hasher: RequestHasher | None = None,
 ) -> EncoderCacheLayout:
-    width = resolve_encoder_output_width(vllm_config, encoder_config)
-    dtype = vllm_config.model_config.dtype
+    model_config = vllm_config.model_config
+    width = encoder_config.get("encoder_cache_hidden_dim")
+    if width is None:
+        vision_config = getattr(model_config.hf_config, "vision_config", None)
+        output_width = getattr(vision_config, "out_hidden_size", None)
+        deepstack_indexes = getattr(vision_config, "deepstack_visual_indexes", None)
+        if output_width is not None and deepstack_indexes is not None:
+            width = output_width * (1 + len(deepstack_indexes))
+        else:
+            width = model_config.get_inputs_embeds_size()
+    width = int(width)
+    if width <= 0:
+        raise EncoderCacheLayoutError(
+            f"Encoder-cache width must be positive, got {width}."
+        )
+
+    dtype = model_config.dtype
     element_size = int(torch.empty((), dtype=dtype).element_size())
-    row_bytes = width * element_size
 
     rows_per_chunk = encoder_config["chunk_size"]
     if (
@@ -195,7 +117,7 @@ def resolve_encoder_cache_layout(
         raise EncoderCacheLayoutError(
             f"chunk_size must be a positive number of rows, got {rows_per_chunk!r}."
         )
-    chunk_bytes = rows_per_chunk * row_bytes
+    chunk_bytes = rows_per_chunk * width * element_size
 
     block_hasher = hasher or RequestHasher(vllm_config, 0)
     layout_id = block_hasher(
@@ -204,8 +126,6 @@ def resolve_encoder_cache_layout(
     return EncoderCacheLayout(
         width=width,
         dtype=dtype,
-        element_size=element_size,
-        row_bytes=row_bytes,
         rows_per_chunk=rows_per_chunk,
         chunk_bytes=chunk_bytes,
         layout_id=layout_id,
@@ -221,7 +141,22 @@ def resolve_cache_namespace(
     if explicit is not None:
         namespace_source: Any = ("explicit", str(explicit))
     else:
-        namespace_source = ("inferred", _model_identity(vllm_config))
+        model_config = vllm_config.model_config
+        mm_config = model_config.multimodal_config
+        mm_hash = mm_config.compute_hash() if mm_config is not None else None
+        hf_config = model_config.hf_config
+        namespace_source = (
+            "inferred",
+            (
+                model_config.model,
+                model_config.revision,
+                model_config.code_revision,
+                model_config.tokenizer_revision,
+                getattr(hf_config, "_commit_hash", None),
+                tuple(getattr(hf_config, "architectures", None) or ()),
+                mm_hash,
+            ),
+        )
     return hasher(("ucm-ec-namespace-v1", namespace_source))
 
 
@@ -311,6 +246,10 @@ class UCMECConnector(ECConnectorBase):
         role: ECConnectorRole,
     ) -> None:
         super().__init__(vllm_config, role)
+        mm_config = vllm_config.model_config.multimodal_config
+        if mm_config is not None and mm_config.is_multimodal_pruning_enabled():
+            raise EncoderCacheLayoutError("UCM EC does not support multimodal pruning.")
+
         ec_config = Config.load_ec_config(vllm_config.ec_transfer_config)
         encoder_config = ec_config["encoder_cache_config"]
         self._block_hasher = RequestHasher(vllm_config, 0)
@@ -661,5 +600,4 @@ __all__ = [
     "make_chunk_ids",
     "resolve_cache_namespace",
     "resolve_encoder_cache_layout",
-    "resolve_encoder_output_width",
 ]

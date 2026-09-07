@@ -80,8 +80,12 @@ ucm_ec_connector:
 
 `Config.load_ec_config()` 直接返回 YAML 的 `ucm_ec_connector` 段，不创建 KV 参数代理。
 必填字段使用下标；可选的 `encoder_cache_hidden_dim`、`cache_namespace`、
-`store_unique_id` 使用 `.get()`，未配置时自动推导。显式 width 必须与推导值一致。
+`store_unique_id` 使用 `.get()`，未配置时自动推导。显式 width 优先，实际 tensor 由 Worker 校验。
 仅在组装 Store 参数时浅拷贝一次 Store 配置，不深拷贝整个 YAML。
+
+`resolve_cache_namespace()` 直接组织模型、revision、HF commit、architecture 和 multimodal
+配置 hash，不再调用独立的模型 identity helper。显式 namespace 与自动 namespace 的
+hash 输入结构保持不变；模型名称仅用于缓存身份隔离，不参与宽度推导分支。
 
 Store 的 `share_buffer_enable` 强制为 `True`，`local_rank_size` 直接覆盖为 TP size，
 与 KV connector 的 MLA 分支一致。`use_gdr` 强制为 `False`；用户配置中出现该键时
@@ -115,17 +119,42 @@ class EncoderCacheLayout:
 def resolve_encoder_cache_layout(
     vllm_config: VllmConfig,
     encoder_config: dict[str, Any],
+    hasher: RequestHasher | None = None,
 ) -> EncoderCacheLayout:
-    width = resolve_encoder_output_width(vllm_config, encoder_config)
-    dtype = vllm_config.model_config.dtype
+    model_config = vllm_config.model_config
+    width = encoder_config.get("encoder_cache_hidden_dim")
+    if width is None:
+        vision_config = getattr(model_config.hf_config, "vision_config", None)
+        output_width = getattr(vision_config, "out_hidden_size", None)
+        deepstack_indexes = getattr(vision_config, "deepstack_visual_indexes", None)
+        if output_width is not None and deepstack_indexes is not None:
+            width = output_width * (1 + len(deepstack_indexes))
+        else:
+            width = model_config.get_inputs_embeds_size()
+    width = int(width)
+    if width <= 0:
+        raise EncoderCacheLayoutError(
+            f"Encoder-cache width must be positive, got {width}."
+        )
+
+    dtype = model_config.dtype
+    element_size = int(torch.empty((), dtype=dtype).element_size())
+
     rows_per_chunk = encoder_config["chunk_size"]
-    if not isinstance(rows_per_chunk, int) or isinstance(rows_per_chunk, bool) or rows_per_chunk <= 0:
-        raise EncoderCacheLayoutError("chunk_size must be a positive number of rows")
-    chunk_bytes = rows_per_chunk * width * dtype_element_size(dtype)
+    if (
+        not isinstance(rows_per_chunk, int)
+        or isinstance(rows_per_chunk, bool)
+        or rows_per_chunk <= 0
+    ):
+        raise EncoderCacheLayoutError(
+            f"chunk_size must be a positive number of rows, got {rows_per_chunk!r}."
+        )
+    chunk_bytes = rows_per_chunk * width * element_size
 
-    # layout_id 同样复用 UCM 现有 hash 方法。
-    layout_id = ucm_hash_layout(width, dtype, rows_per_chunk)
-
+    block_hasher = hasher or RequestHasher(vllm_config, 0)
+    layout_id = block_hasher(
+        ("ucm-ec-layout-v1", width, str(dtype), rows_per_chunk)
+    )
     return EncoderCacheLayout(
         width=width,
         dtype=dtype,
@@ -133,10 +162,13 @@ def resolve_encoder_cache_layout(
         chunk_bytes=chunk_bytes,
         layout_id=layout_id,
     )
+
 ```
 
-`ucm_hash_layout()` 在实现中应映射到 UCM 已有 hash helper；本文不重新定义
-`blake2b/H128`。
+宽度、dtype、chunk 行数、字节数和 layout ID 在同一个函数中解析。显式
+`encoder_cache_hidden_dim` 优先；否则使用 deepstack 结构字段或 vLLM 的
+`get_inputs_embeds_size()`。不按模型名称选择分支，也不以通用输入宽度否定显式 EC
+宽度。Worker 保存时仍校验实际 tensor。布局不符合这两种推导约定时需显式配置宽度。
 
 ### 3.2 Scheduler identifier state
 
@@ -227,16 +259,22 @@ class UCMECConnector(ECConnectorBase):
         role: ECConnectorRole,
     ) -> None:
         super().__init__(vllm_config, role)
+        mm_config = vllm_config.model_config.multimodal_config
+        if mm_config is not None and mm_config.is_multimodal_pruning_enabled():
+            raise EncoderCacheLayoutError("UCM EC does not support multimodal pruning.")
 
         ec_config = Config.load_ec_config(vllm_config.ec_transfer_config)
         encoder_config = ec_config["encoder_cache_config"]
+        self._block_hasher = RequestHasher(vllm_config, 0)
         self.layout = resolve_encoder_cache_layout(
             vllm_config,
             encoder_config,
+            self._block_hasher,
         )
         self.cache_namespace = resolve_cache_namespace(
             vllm_config,
             encoder_config,
+            self._block_hasher,
         )
 
         # 复用现有 UCM connector 的 rank/device 初始化。Scheduler 不分配
