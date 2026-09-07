@@ -139,9 +139,20 @@ class ECConfigTest(unittest.TestCase):
         )
         self.assertEqual(self.layout().width, 1024)
 
-    def test_incomplete_vision_layout_uses_vllm_input_width(self):
+    def test_missing_or_none_deepstack_uses_output_width(self):
+        for vision_config in (
+            SimpleNamespace(out_hidden_size=1024),
+            SimpleNamespace(out_hidden_size=1024, deepstack_visual_indexes=None),
+        ):
+            with self.subTest(vision_config=vision_config):
+                self.vllm_config.model_config.hf_config = SimpleNamespace(
+                    vision_config=vision_config,
+                )
+                self.assertEqual(self.layout().width, 1024)
+
+    def test_missing_output_width_uses_vllm_input_width(self):
         self.vllm_config.model_config.hf_config = SimpleNamespace(
-            vision_config=SimpleNamespace(out_hidden_size=1024),
+            vision_config=SimpleNamespace(deepstack_visual_indexes=[1, 3]),
         )
         self.assertEqual(self.layout().width, 5120)
 
@@ -179,11 +190,8 @@ class ECConfigTest(unittest.TestCase):
             ec.resolve_cache_namespace(self.vllm_config, {}, hasher), b"namespace"
         )
         hasher.assert_called_once_with((
-            "ucm-ec-namespace-v1",
-            ("inferred", (
-                "org/model", "weights-revision", "code-revision",
-                "tokenizer-revision", "commit", ("CustomArchitecture",), "mm-hash",
-            )),
+            "org/model", "weights-revision", "code-revision",
+            "tokenizer-revision", "commit", ("CustomArchitecture",), "mm-hash",
         ))
 
     def test_explicit_namespace_bypasses_model_identity(self):
@@ -191,9 +199,7 @@ class ECConfigTest(unittest.TestCase):
         ec.resolve_cache_namespace(
             SimpleNamespace(), {"cache_namespace": "shared"}, hasher
         )
-        hasher.assert_called_once_with((
-            "ucm-ec-namespace-v1", ("explicit", "shared"),
-        ))
+        hasher.assert_called_once_with("shared")
 
     def test_store_overrides_do_not_mutate_yaml_and_preserve_backend_string(self):
         self.config["ucm_connector_config"].update(

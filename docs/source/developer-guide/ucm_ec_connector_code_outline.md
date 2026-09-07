@@ -110,7 +110,6 @@ class EncoderCacheLayout:
     dtype: torch.dtype
     rows_per_chunk: int
     chunk_bytes: int
-    layout_id: bytes
 ```
 
 启动期解析：
@@ -119,15 +118,16 @@ class EncoderCacheLayout:
 def resolve_encoder_cache_layout(
     vllm_config: VllmConfig,
     encoder_config: dict[str, Any],
-    hasher: RequestHasher | None = None,
 ) -> EncoderCacheLayout:
     model_config = vllm_config.model_config
     width = encoder_config.get("encoder_cache_hidden_dim")
     if width is None:
         vision_config = getattr(model_config.hf_config, "vision_config", None)
         output_width = getattr(vision_config, "out_hidden_size", None)
-        deepstack_indexes = getattr(vision_config, "deepstack_visual_indexes", None)
-        if output_width is not None and deepstack_indexes is not None:
+        if output_width is not None:
+            deepstack_indexes = (
+                getattr(vision_config, "deepstack_visual_indexes", None) or ()
+            )
             width = output_width * (1 + len(deepstack_indexes))
         else:
             width = model_config.get_inputs_embeds_size()
@@ -151,24 +151,20 @@ def resolve_encoder_cache_layout(
         )
     chunk_bytes = rows_per_chunk * width * element_size
 
-    block_hasher = hasher or RequestHasher(vllm_config, 0)
-    layout_id = block_hasher(
-        ("ucm-ec-layout-v1", width, str(dtype), rows_per_chunk)
-    )
     return EncoderCacheLayout(
         width=width,
         dtype=dtype,
         rows_per_chunk=rows_per_chunk,
         chunk_bytes=chunk_bytes,
-        layout_id=layout_id,
     )
 
 ```
 
-宽度、dtype、chunk 行数、字节数和 layout ID 在同一个函数中解析。显式
-`encoder_cache_hidden_dim` 优先；否则使用 deepstack 结构字段或 vLLM 的
-`get_inputs_embeds_size()`。不按模型名称选择分支，也不以通用输入宽度否定显式 EC
-宽度。Worker 保存时仍校验实际 tensor。布局不符合这两种推导约定时需显式配置宽度。
+宽度、dtype、chunk 行数和字节数在同一个函数中解析。显式
+`encoder_cache_hidden_dim` 优先；否则只要存在 `out_hidden_size` 就以它为基础输出宽度，
+缺失、为 `None` 或为空的 `deepstack_visual_indexes` 按 0 层处理。没有
+`out_hidden_size` 时使用 vLLM 的 `get_inputs_embeds_size()`。不按模型名称选择分支，也
+不以通用输入宽度否定显式 EC 宽度。Worker 保存时仍校验实际 tensor。
 
 ### 3.2 Scheduler identifier state
 
@@ -185,7 +181,7 @@ class IdentifierState:
 ```text
 num_chunks   = len(chunk_ids)
 valid_bytes  = num_embeds * D * element_size
-layout_id    = connector 级常量
+rows_per_chunk = connector 级常量
 ```
 
 ### 3.3 Scheduler -> Worker load metadata
@@ -237,7 +233,7 @@ def make_chunk_ids(
     return tuple(
         ucm_hash_block_id(
             cache_namespace,
-            layout.layout_id,
+            layout.rows_per_chunk,
             identifier,
             num_embeds,
             chunk_index,

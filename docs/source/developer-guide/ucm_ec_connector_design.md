@@ -112,7 +112,7 @@ VllmConfig
   -> resolve_encoder_cache_layout()
   -> D / dtype / element_size
   -> rows_per_chunk / chunk_bytes
-  -> layout_id / cache_namespace
+  -> cache_namespace
   -> initialize configured UCM Store
 ```
 
@@ -135,10 +135,11 @@ layout API；特殊布局需要明确的结构约定或显式 EC 宽度。
 路径或 architecture 名称选择配置分支：
 
 1. `encoder_cache_hidden_dim` 非空时，优先采用用户指定的 EC 宽度。
-2. 未显式配置且 `vision_config` 同时提供 `out_hidden_size` 和
-   `deepstack_visual_indexes` 时，按拼接布局计算
-   `D = out_hidden_size * (1 + len(deepstack_visual_indexes))`；空索引列表的倍率为 1。
-3. 其余情况使用 vLLM 的 `model_config.get_inputs_embeds_size()`。
+2. 未显式配置且 `vision_config` 提供 `out_hidden_size` 时，以它作为基础输出宽度。
+   `deepstack_visual_indexes` 缺失、为 `None` 或为空时按 0 层处理；否则按拼接布局计算
+   `D = out_hidden_size * (1 + len(deepstack_visual_indexes))`。
+3. 未提供 `out_hidden_size` 时使用 vLLM 的
+   `model_config.get_inputs_embeds_size()`。
 
 显式宽度不再无条件与通用输入宽度比较。完整 EC 宽度可能不同于语言模型输入宽度，
 特殊布局应允许显式配置。宽度必须为正，Worker dump 仍检查真实 tensor 的 shape 和 dtype。
@@ -156,19 +157,13 @@ class EncoderCacheLayout:
     dtype: torch.dtype
     rows_per_chunk: int
     chunk_bytes: int
-    layout_id: bytes
 ```
 
-`layout_id` 至少包含：
-
-- `D`；
-- dtype；
-- `rows_per_chunk`；
-
-`layout_id` 只描述 block 的物理解释方式，不承载模型语义。若 Store 的 unique id 已经
-保证 dtype 隔离，也可以只包含 `D` 和 `rows_per_chunk`。模型标识、权重 revision 和
-会改变 encoder 输出的 processor 配置应由独立的部署 namespace 隔离，而不是在每个
-identifier 状态中重复保存。
+`EncoderCacheLayout` 只描述 block 的物理解释方式（宽度、dtype、chunk 行数、
+字节数），不承载模型语义。模型标识、权重 revision 和会改变 encoder 输出的
+processor 配置由独立的部署 `cache_namespace` 隔离，而不是在每个 identifier
+状态中重复保存。`rows_per_chunk` 是唯一不被 `cache_namespace` 覆盖的 layout
+维度，因此它直接进入 chunk key（见第 7 节），不再额外计算中间摘要。
 
 不能只依赖 `ModelConfig.compute_hash()`，因为它并不保证覆盖所有影响多模态
 encoder 输出的配置。
@@ -272,9 +267,8 @@ UCM 当前 KV connector 保持一致：
 
 ```text
 chunk_id = ucm_hash_block_id(
-    "ucm-ec-v1",
     cache_namespace,
-    layout_id,
+    rows_per_chunk,
     identifier,
     num_encoder_embeds,
     chunk_index
@@ -285,8 +279,9 @@ chunk_id = ucm_hash_block_id(
 `H128/blake2b`，也不引入第二套 block-id 格式。
 
 其中 `cache_namespace` 在 connector 启动时由模型、权重 revision 及影响 encoder
-输出的配置确定，或者由部署显式配置；它和 `layout_id` 都是 connector 级常量，不进入
-每个 `IdentifierState`。
+输出的配置确定，或者由部署显式配置；它是 connector 级常量，不进入每个
+`IdentifierState`。`rows_per_chunk` 直接放进 key，使得同一 namespace 下不同 chunk
+粒度的部署生成不同 key，表现为 miss 而非加载错误行范围。
 
 必须把 `num_encoder_embeds` 放入 key。否则同一个 identifier 在异常情况下对应
 不同 `N` 时，较短对象可能错误命中较长对象的 chunk 前缀。
@@ -328,7 +323,7 @@ pending_loads: dict[str, ECLoadSpec]
 
 `identifier` 已经是 `identifier_to_blocks` 的 key；`num_chunks` 等于
 `len(chunk_ids)`；`valid_nbytes` 可以由 `num_embeds * width * dtype.itemsize` 计算；
-`layout_id` 是 connector 级常量。因此这些字段都不在每个 identifier 中重复保存。
+`rows_per_chunk` 是 connector 级常量。因此这些字段都不在每个 identifier 中重复保存。
 
 ### 8.2 为什么需要 request ref count
 
@@ -886,9 +881,9 @@ identifier state 仍存在
 
 ### 11.4 Producer/Consumer 配置不一致
 
-Producer 和 Consumer 的 `layout_id` 或 `cache_namespace` 不一致时，它们生成不同
+Producer 和 Consumer 的 `rows_per_chunk` 或 `cache_namespace` 不一致时，它们生成不同
 chunk key，因此表现为 miss，而不是加载错误 tensor。启动日志必须打印 namespace 和
-layout 摘要便于排查。
+layout 各字段便于排查。
 
 ### 11.5 Shape 不一致
 
@@ -1067,7 +1062,8 @@ has_cache_item(identifier)
 
 - 普通布局调用 vLLM 通用输入宽度接口；
 - 相同 deepstack 结构在模型重命名后仍推导出相同宽度；
-- deepstack 索引为空时使用单份输出宽度，缺少完整结构时使用通用接口；
+- deepstack 索引缺失、为 `None` 或为空时使用单份 `out_hidden_size`；
+- 缺少 `out_hidden_size` 时使用 vLLM 通用接口；
 - 显式 EC 宽度优先，不调用通用宽度推导；
 - 非正宽度拒绝初始化；
 - connector 初始化时拒绝 pruning，且不创建 Store；
@@ -1147,7 +1143,7 @@ ucm_ec_tail_padding_bytes_total
 
 ```text
 model / revision / D / dtype / rows_per_chunk /
-chunk_bytes / layout_id / cache_namespace / pipeline / dp rank / save rank
+chunk_bytes / cache_namespace / pipeline / dp rank / save rank
 ```
 
 日志禁止输出原始图片数据；identifier 只打印短前缀。

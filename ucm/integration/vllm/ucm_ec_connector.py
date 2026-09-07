@@ -63,7 +63,6 @@ class EncoderCacheLayout:
     dtype: torch.dtype
     rows_per_chunk: int
     chunk_bytes: int
-    layout_id: bytes
 
 
 @dataclass(slots=True)
@@ -87,15 +86,16 @@ class UCMECConnectorMetadata(ECConnectorMetadata):
 def resolve_encoder_cache_layout(
     vllm_config: VllmConfig,
     encoder_config: dict[str, Any],
-    hasher: RequestHasher | None = None,
 ) -> EncoderCacheLayout:
     model_config = vllm_config.model_config
     width = encoder_config.get("encoder_cache_hidden_dim")
     if width is None:
         vision_config = getattr(model_config.hf_config, "vision_config", None)
         output_width = getattr(vision_config, "out_hidden_size", None)
-        deepstack_indexes = getattr(vision_config, "deepstack_visual_indexes", None)
-        if output_width is not None and deepstack_indexes is not None:
+        if output_width is not None:
+            deepstack_indexes = (
+                getattr(vision_config, "deepstack_visual_indexes", None) or ()
+            )
             width = output_width * (1 + len(deepstack_indexes))
         else:
             width = model_config.get_inputs_embeds_size()
@@ -119,16 +119,11 @@ def resolve_encoder_cache_layout(
         )
     chunk_bytes = rows_per_chunk * width * element_size
 
-    block_hasher = hasher or RequestHasher(vllm_config, 0)
-    layout_id = block_hasher(
-        ("ucm-ec-layout-v1", width, str(dtype), rows_per_chunk)
-    )
     return EncoderCacheLayout(
         width=width,
         dtype=dtype,
         rows_per_chunk=rows_per_chunk,
         chunk_bytes=chunk_bytes,
-        layout_id=layout_id,
     )
 
 
@@ -139,25 +134,22 @@ def resolve_cache_namespace(
 ) -> bytes:
     explicit = encoder_config.get("cache_namespace")
     if explicit is not None:
-        namespace_source: Any = ("explicit", str(explicit))
+        namespace_source: str | tuple = str(explicit)
     else:
         model_config = vllm_config.model_config
         mm_config = model_config.multimodal_config
         mm_hash = mm_config.compute_hash() if mm_config is not None else None
         hf_config = model_config.hf_config
         namespace_source = (
-            "inferred",
-            (
-                model_config.model,
-                model_config.revision,
-                model_config.code_revision,
-                model_config.tokenizer_revision,
-                getattr(hf_config, "_commit_hash", None),
-                tuple(getattr(hf_config, "architectures", None) or ()),
-                mm_hash,
-            ),
+            model_config.model,
+            model_config.revision,
+            model_config.code_revision,
+            model_config.tokenizer_revision,
+            getattr(hf_config, "_commit_hash", None),
+            tuple(getattr(hf_config, "architectures", None) or ()),
+            mm_hash,
         )
-    return hasher(("ucm-ec-namespace-v1", namespace_source))
+    return hasher(namespace_source)
 
 
 def make_chunk_ids(
@@ -179,9 +171,8 @@ def make_chunk_ids(
     return tuple(
         hasher(
             (
-                "ucm-ec-v1",
                 cache_namespace,
-                layout.layout_id,
+                layout.rows_per_chunk,
                 identifier,
                 num_embeds,
                 chunk_index,
@@ -254,7 +245,7 @@ class UCMECConnector(ECConnectorBase):
         encoder_config = ec_config["encoder_cache_config"]
         self._block_hasher = RequestHasher(vllm_config, 0)
         self.layout = resolve_encoder_cache_layout(
-            vllm_config, encoder_config, self._block_hasher
+            vllm_config, encoder_config
         )
         self.cache_namespace = resolve_cache_namespace(
             vllm_config, encoder_config, self._block_hasher
@@ -295,7 +286,7 @@ class UCMECConnector(ECConnectorBase):
         logger.info(
             "Initialized UCM EC connector: role=%s, producer=%s, consumer=%s, "
             "width=%s, dtype=%s, rows_per_chunk=%s, chunk_bytes=%s, "
-            "layout_id=%s, cache_namespace=%s, save_rank=%s",
+            "cache_namespace=%s, save_rank=%s",
             role.name,
             self.is_producer,
             self.is_consumer,
@@ -303,7 +294,6 @@ class UCMECConnector(ECConnectorBase):
             self.layout.dtype,
             self.layout.rows_per_chunk,
             self.layout.chunk_bytes,
-            self.layout.layout_id.hex(),
             self.cache_namespace.hex(),
             self.is_save_rank,
         )
