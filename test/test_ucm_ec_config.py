@@ -47,7 +47,10 @@ class ECConfigTest(unittest.TestCase):
         )
 
     def create_store(self, role=ec.ECConnectorRole.SCHEDULER):
-        with patch.object(ec.UcmConnectorFactoryV1, "create_connector") as factory:
+        with (
+            patch.object(ec.UcmConnectorFactoryV1, "create_connector") as factory,
+            patch.object(ec, "_check_shm_capacity") as check_shm,
+        ):
             result = ec.create_ucm_ec_store(
                 vllm_config=self.vllm_config,
                 role=role,
@@ -55,6 +58,7 @@ class ECConfigTest(unittest.TestCase):
                 ec_config=self.config,
                 device_id=-1 if role == ec.ECConnectorRole.SCHEDULER else 0,
             )
+        self.check_shm = check_shm
         self.assertIs(result, factory.return_value)
         name, config = factory.call_args.args
         self.assertEqual(name, "CustomRegisteredStore")
@@ -201,20 +205,32 @@ class ECConfigTest(unittest.TestCase):
         )
         hasher.assert_called_once_with("shared")
 
-    def test_store_overrides_do_not_mutate_yaml_and_preserve_backend_string(self):
+    def test_store_overrides_do_not_mutate_yaml_and_split_backends(self):
         self.config["ucm_connector_config"].update(
             share_buffer_enable=False,
             local_rank_size=99,
         )
         original = copy.deepcopy(self.config)
-        config = self.create_store()
+        config = self.create_store(ec.ECConnectorRole.WORKER)
         self.assertEqual(self.config, original)
-        self.assertEqual(config["storage_backends"], "/first:/second")
+        self.assertEqual(config["storage_backends"], ["/first", "/second"])
         self.assertTrue(config["share_buffer_enable"])
         self.assertEqual(config["local_rank_size"], 4)
         self.assertEqual(config["tensor_size_list"], [3 * 5120 * 2])
+        self.assertEqual(config["shard_size"], 32768)
+        self.assertEqual(config["block_size"], 32768)
         self.assertNotIn("gpu_kv_buffer_addrs", config)
         self.assertNotIn("gpu_kv_buffer_sizes", config)
+
+    def test_shared_buffer_capacity_defaults_and_is_checked(self):
+        config = self.create_store()
+        self.assertEqual(config["cache_buffer_capacity_gb"], 128)
+        self.check_shm.assert_called_once_with(128)
+
+        self.config["ucm_connector_config"]["cache_buffer_capacity_gb"] = 32
+        config = self.create_store()
+        self.assertEqual(config["cache_buffer_capacity_gb"], 32)
+        self.check_shm.assert_called_once_with(32)
 
     def test_gdr_is_disabled_and_warns_only_when_configured(self):
         with patch.object(ec.logger, "warning") as warning:
@@ -242,6 +258,19 @@ class ECConfigTest(unittest.TestCase):
                         config = self.create_store(role)
                         self.assertEqual(config["posix_gc_enable"], owner)
                         self.assertEqual(config["posix_capacity_gb"], capacity)
+                        if owner:
+                            self.assertEqual(config["block_size"], 32768)
+                        elif role == ec.ECConnectorRole.SCHEDULER:
+                            self.assertNotIn("block_size", config)
+                        else:
+                            self.assertEqual(config["block_size"], 32768)
+
+    def test_yuanrong_posix_gc_uses_persisted_object_size(self):
+        self.config["ucm_connector_config"]["store_pipeline"] = (
+            "YuanRong|Posix"
+        )
+        config = self.create_store(ec.ECConnectorRole.SCHEDULER)
+        self.assertEqual(config["block_size"], 3 * 5120 * 2)
 
     def test_store_namespace_default_fallback_and_override(self):
         self.assertEqual(self.create_store()["unique_id"], "instance.ec.dp0")

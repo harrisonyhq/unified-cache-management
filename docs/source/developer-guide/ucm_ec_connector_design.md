@@ -185,8 +185,9 @@ rows_per_chunk = encoder_config["chunk_size"]
 chunk_bytes = rows_per_chunk * width * element_size
 ```
 
-若所选后端或 I/O 模式要求字节对齐，配置的行数必须满足其约束；例如 Posix direct I/O
-通常要求 `chunk_bytes % 4096 == 0`。此约束属于后端，不是 EC 通用 layout 参数。
+`chunk_bytes` 是 EC chunk 的逻辑数据长度。Store 使用与 KV connector 相同的尺寸推导，
+将它转换成满足 I/O 对齐要求的物理 `shard_size` 和 `block_size`；用户不需要配置
+EC 专用的对齐参数。
 
 ## 6. Store 初始化
 
@@ -194,24 +195,30 @@ Scheduler 使用 `device_id=-1` 的 Store 进行 lookup；Worker 使用真实 de
 Store 执行 load/dump。两者必须使用相同的 `unique_id`、pipeline、block layout 和
 持久化路径。
 
-Store 创建时读取 `ucm_connector_name`，浅拷贝 `ucm_connector_config`，
-补充运行参数后调用 `UcmConnectorFactoryV1.create_connector(name, store_config)`。
+Store 创建时读取 `ucm_connector_name`，浅拷贝 `ucm_connector_config`，将字符串形式的
+`storage_backends` 按 `:` 分割为列表，再补充运行参数并调用
+`UcmConnectorFactoryV1.create_connector(name, store_config)`。
 
 ```python
-store_config.update({
-    "unique_id": f"{instance_id}.ec.dp{dp_rank}",
-    "device_id": device_id,
-    "tensor_size_list": [layout.chunk_bytes],
-    "shard_size": layout.chunk_bytes,
-    "block_size": layout.chunk_bytes,
-    "share_buffer_enable": True,
-    "local_rank_size": vllm_config.parallel_config.tensor_parallel_size,
-    "use_gdr": False,
-    "posix_gc_enable": (
-        role == ECConnectorRole.SCHEDULER and dp_rank == 0
-    ),
-})
+tensor_size_list = [layout.chunk_bytes]
+store_shard_size, store_block_size = _get_store_io_sizes(
+    layout.chunk_bytes, layout.chunk_bytes
+)
+gc_block_size = _get_store_gc_block_size(
+    store_config.get("store_pipeline", ""),
+    tensor_size_list,
+    store_shard_size,
+    store_block_size,
+)
 ```
+
+Worker 使用逻辑 `tensor_size_list` 和物理 `store_shard_size/store_block_size`。DP0
+Scheduler 是唯一 GC owner，其 `block_size` 使用 `gc_block_size`。普通 pipeline 的
+`gc_block_size` 等于物理 Store block 大小；`YuanRong|Posix` 使用与 KV connector
+相同的持久化对象大小推导。这样 `posix_capacity_gb` 能按实际文件大小计算容量和淘汰。
+
+EC 强制开启共享 buffer。缺省的 `cache_buffer_capacity_gb` 与 KV connector 一致设为
+128，并在创建 Store 前检查 `/dev/shm` 容量。
 
 `local_rank_size` 与 KV connector 的 MLA 模式一致，直接取 TP size 并覆盖用户配置。
 它控制各设备加载 chunk 的遍历顺序，使不同 rank 优先获取不同共享 buffer；每个 rank
@@ -221,8 +228,9 @@ connector 自身还要取得 Worker tensor 分配所用的 torch device，不能
 交给 Store。EC connector 不重新实现平台判断：应把当前
 `UCMDirectConnector.__init__` 中的 CUDA-alike/NPU torch-device 分支提取到
 `ucm.integration.vllm.device` 的公共 helper，KV connector 与 EC connector 共同调用。
-Scheduler 使用 `local_rank=-1`、`device_id=-1`、`device=None`；Worker 使用
-`get_world_group().local_rank`，并将该 local rank 同时交给公共 helper 和 Store。
+Scheduler 使用 `local_rank=-1`、`device_id=-1`、`device=None`；Worker 的
+`local_rank` 取 `get_world_group().local_rank`，Store `device_id` 取
+`get_current_device_id()`，从而支持可见设备重映射。
 `start_load_caches()` 只能在 Worker 侧使用返回的 `torch.device` 分配目标 storage。
 
 不要直接继承整个 `UCMDirectConnector`，因为它是 `KVConnectorBase_V1` 的实现，会引入
@@ -972,7 +980,8 @@ ucm_ec_connector:
 
 `ucm_connector_name` 通过 UCM factory 选择已注册的 Store，不固定为 Pipeline Store；
 `Cache|Posix` 是上面的示例配置。`ucm_connector_config` 与 `encoder_cache_config`
-同级。`storage_backends` 字符串原样交给 Store，connector 不分割或转换为列表。
+同级。YAML 中 `storage_backends` 保持冒号分隔的字符串，创建 Store 前按与 KV
+connector 相同的规则分割为路径列表。
 
 `Config.load_ec_config()` 直接返回 YAML 的 `ucm_ec_connector` 段，不创建 KV 参数代理。
 必填字段使用下标；可选的 `encoder_cache_hidden_dim`、`cache_namespace`、
@@ -989,6 +998,8 @@ Store 的 `share_buffer_enable` 强制为 `True`，`local_rank_size` 直接覆�
 `posix_capacity_gb` 配置 GC 容量；省略或设为 0 时不启动 GC。与现有 KV connector
 一致，内部 `posix_gc_enable` 直接覆盖为是否 DP0 Scheduler，不作为 YAML 用户开关。
 Posix Store 根据该内部 owner 标志与 `posix_capacity_gb > 0` 共同决定是否启动 GC。
+GC 使用 Store 实际持久化对象的 `gc_block_size`，而不是未经对齐的元素数量；EC 的逻辑
+chunk 字节数为 `chunk_size * width * dtype.itemsize`。
 
 用户只通过 `chunk_size` 指定第一维切块行数；不提供字节目标、对齐粒度或宽度校验开关。
 当前不支持 multimodal pruning，检测到模型启用该模式时拒绝初始化。

@@ -29,8 +29,16 @@ from vllm.distributed.parallel_state import (
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import ECConnectorOutput
 
-from ucm.integration.vllm.device import get_ucm_worker_torch_device
+from ucm.integration.vllm.device import (
+    get_current_device_id,
+    get_ucm_worker_torch_device,
+)
 from ucm.integration.vllm.request_hasher import RequestHasher
+from ucm.integration.vllm.ucm_connector import (
+    _check_shm_capacity,
+    _get_store_gc_block_size,
+    _get_store_io_sizes,
+)
 from ucm.logger import init_logger
 from ucm.store.factory_v1 import UcmConnectorFactoryV1
 from ucm.store.ucmstore_v1 import UcmKVStoreBaseV1
@@ -196,34 +204,69 @@ def create_ucm_ec_store(
     if "use_gdr" in store_config:
         logger.warning("UCM EC ignores configured use_gdr; GDR is disabled.")
 
+    if "storage_backends" in store_config:
+        store_config["storage_backends"] = [
+            path for path in store_config["storage_backends"].split(":")
+        ]
+
+    store_config["share_buffer_enable"] = True
+    store_config.setdefault("cache_buffer_capacity_gb", 128)
+    _check_shm_capacity(int(store_config["cache_buffer_capacity_gb"]))
+
+    tensor_size_list = [layout.chunk_bytes]
+    store_shard_size, store_block_size = _get_store_io_sizes(
+        layout.chunk_bytes,
+        layout.chunk_bytes,
+    )
+    gc_block_size = _get_store_gc_block_size(
+        str(store_config.get("store_pipeline", "")),
+        tensor_size_list,
+        store_shard_size,
+        store_block_size,
+    )
+
     parallel_config = vllm_config.parallel_config
     dp_rank = parallel_config.data_parallel_rank
     instance_id = vllm_config.instance_id or vllm_config.ec_transfer_config.engine_id
+    # Store sharing/isolation domain: same id ⇒ shared shm + namespace.
+    # instance_id aligns scheduler/workers; dp{rank} isolates DP domains.
     unique_id = encoder_config.get("store_unique_id")
     if unique_id is None:
         unique_id = f"{instance_id}.ec.dp{dp_rank}"
+
+    gc_owner = role == ECConnectorRole.SCHEDULER and dp_rank == 0
 
     store_config.update(
         {
             "unique_id": unique_id,
             "device_id": device_id,
-            "share_buffer_enable": True,
+            # TP size so ranks sharing one buffer get staggered traversal
+            # order; each rank still loads the full EC (single-writer stays).
             "local_rank_size": parallel_config.tensor_parallel_size,
             "use_gdr": False,
-            "tensor_size_list": [layout.chunk_bytes],
-            "shard_size": layout.chunk_bytes,
-            "block_size": layout.chunk_bytes,
-            "posix_gc_enable": (
-                role == ECConnectorRole.SCHEDULER and dp_rank == 0
-            ),
+            "posix_gc_enable": gc_owner,
         }
     )
+    if role == ECConnectorRole.WORKER:
+        store_config.update(
+            {
+                "tensor_size_list": tensor_size_list,
+                "shard_size": store_shard_size,
+                "block_size": store_block_size,
+            }
+        )
+    elif gc_owner:
+        store_config["block_size"] = gc_block_size
+
     logger.info(
-        "Creating UCM EC store %s: unique_id=%s, device_id=%s, chunk_bytes=%s",
+        "Creating UCM EC store %s: unique_id=%s, device_id=%s, "
+        "chunk_bytes=%s, store_block_size=%s, gc_block_size=%s",
         name,
         unique_id,
         device_id,
         layout.chunk_bytes,
+        store_block_size,
+        gc_block_size,
     )
     return UcmConnectorFactoryV1.create_connector(name, store_config)
 
@@ -238,6 +281,11 @@ class UCMECConnector(ECConnectorBase):
     ) -> None:
         super().__init__(vllm_config, role)
         mm_config = vllm_config.model_config.multimodal_config
+        # Pruning drops a content-dependent subset of encoder tokens before
+        # the LM, so the reusable unit is no longer a fixed full [N, D]
+        # tensor and N is no longer stable — both break EC's cache model.
+        # TODO: support pruned encoder output if a stable per-identifier
+        #       selection can be derived.
         if mm_config is not None and mm_config.is_multimodal_pruning_enabled():
             raise EncoderCacheLayoutError("UCM EC does not support multimodal pruning.")
 
@@ -256,11 +304,15 @@ class UCMECConnector(ECConnectorBase):
             if role == ECConnectorRole.SCHEDULER
             else int(get_world_group().local_rank)
         )
-        self.device_id = self.local_rank
+        self.device_id = (
+            -1
+            if role == ECConnectorRole.SCHEDULER
+            else get_current_device_id()
+        )
         self.device = (
             None
             if role == ECConnectorRole.SCHEDULER
-            else get_ucm_worker_torch_device(self.local_rank)
+            else get_ucm_worker_torch_device(self.device_id)
         )
         self.store: UcmKVStoreBaseV1 | None = create_ucm_ec_store(
             vllm_config=vllm_config,
@@ -296,17 +348,6 @@ class UCMECConnector(ECConnectorBase):
             self.layout.chunk_bytes,
             self.cache_namespace.hex(),
             self.is_save_rank,
-        )
-
-    def _make_chunk_ids(
-        self, identifier: str, num_embeds: int
-    ) -> tuple[bytes, ...]:
-        return make_chunk_ids(
-            identifier=identifier,
-            num_embeds=num_embeds,
-            layout=self.layout,
-            cache_namespace=self.cache_namespace,
-            hasher=self._block_hasher,
         )
 
     def ensure_cache_available(
@@ -345,7 +386,13 @@ class UCMECConnector(ECConnectorBase):
             else:
                 state = IdentifierState(
                     num_embeds=num_embeds,
-                    chunk_ids=self._make_chunk_ids(identifier, num_embeds),
+                    chunk_ids=make_chunk_ids(
+                        identifier=identifier,
+                        num_embeds=num_embeds,
+                        layout=self.layout,
+                        cache_namespace=self.cache_namespace,
+                        hasher=self._block_hasher,
+                    ),
                 )
             request_states[identifier] = state
 
@@ -520,7 +567,13 @@ class UCMECConnector(ECConnectorBase):
         num_embeds = int(tensor.shape[0])
         rows = self.layout.rows_per_chunk
         width = self.layout.width
-        chunk_ids = self._make_chunk_ids(mm_hash, num_embeds)
+        chunk_ids = make_chunk_ids(
+            identifier=mm_hash,
+            num_embeds=num_embeds,
+            layout=self.layout,
+            cache_namespace=self.cache_namespace,
+            hasher=self._block_hasher,
+        )
 
         num_full_chunks, tail_rows = divmod(num_embeds, rows)
         try:

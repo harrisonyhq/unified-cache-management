@@ -76,7 +76,8 @@ ucm_ec_connector:
 
 `ucm_connector_name` 通过 UCM factory 选择已注册的 Store，不固定为 Pipeline Store；
 `Cache|Posix` 是上面的示例配置。`ucm_connector_config` 与 `encoder_cache_config`
-同级。`storage_backends` 字符串原样交给 Store，connector 不分割或转换为列表。
+同级。YAML 中 `storage_backends` 保持冒号分隔的字符串，创建 Store 前按与 KV
+connector 相同的规则分割为路径列表。
 
 `Config.load_ec_config()` 直接返回 YAML 的 `ucm_ec_connector` 段，不创建 KV 参数代理。
 必填字段使用下标；可选的 `encoder_cache_hidden_dim`、`cache_namespace`、
@@ -89,10 +90,14 @@ hash 输入结构保持不变；模型名称仅用于缓存身份隔离，不参
 
 Store 的 `share_buffer_enable` 强制为 `True`，`local_rank_size` 直接覆盖为 TP size，
 与 KV connector 的 MLA 分支一致。`use_gdr` 强制为 `False`；用户配置中出现该键时
-输出 warning。EC 不注入预注册 GPU KV buffer 地址或大小。用户通过
+输出 warning。共享 buffer 容量未配置时默认使用 128GB，并在创建 Store 前检查
+`/dev/shm` 容量。EC 不注入预注册 GPU KV buffer 地址或大小。用户通过
 `posix_capacity_gb` 配置 GC 容量；省略或设为 0 时不启动 GC。与现有 KV connector
 一致，内部 `posix_gc_enable` 直接覆盖为是否 DP0 Scheduler，不作为 YAML 用户开关。
 Posix Store 根据该内部 owner 标志与 `posix_capacity_gb > 0` 共同决定是否启动 GC。
+Worker 通过 KV connector 已有的尺寸 helper 将
+`chunk_size * width * dtype.itemsize` 转换为 Store 物理 shard/block 大小；DP0 Scheduler
+使用同一套后端规则推导实际持久化对象的 GC block size。
 
 用户只通过 `chunk_size` 指定第一维切块行数；不提供字节目标、对齐粒度或宽度校验开关。
 当前不支持 multimodal pruning，检测到模型启用该模式时拒绝初始化。
@@ -280,11 +285,15 @@ class UCMECConnector(ECConnectorBase):
             if role == ECConnectorRole.SCHEDULER
             else get_world_group().local_rank
         )
-        self.device_id = self.local_rank
+        self.device_id = (
+            -1
+            if role == ECConnectorRole.SCHEDULER
+            else get_current_device_id()
+        )
         self.device: torch.device | None = (
             None
             if role == ECConnectorRole.SCHEDULER
-            else get_ucm_worker_torch_device(self.local_rank)
+            else get_ucm_worker_torch_device(self.device_id)
         )
 
         # 每个进程各自创建 handle，但连接同一个配置指定的逻辑 Store。
