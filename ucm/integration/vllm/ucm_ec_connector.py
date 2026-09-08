@@ -74,6 +74,12 @@ class EncoderCacheLayout:
 
 
 @dataclass(slots=True)
+class RequestState:
+    processed_feature_count: int = 0
+    identifier_states: dict[str, IdentifierState] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class IdentifierState:
     num_embeds: int
     chunk_ids: tuple[bytes, ...]
@@ -281,11 +287,12 @@ class UCMECConnector(ECConnectorBase):
     ) -> None:
         super().__init__(vllm_config, role)
         mm_config = vllm_config.model_config.multimodal_config
-        # Pruning drops a content-dependent subset of encoder tokens before
-        # the LM, so the reusable unit is no longer a fixed full [N, D]
-        # tensor and N is no longer stable — both break EC's cache model.
-        # TODO: support pruned encoder output if a stable per-identifier
-        #       selection can be derived.
+        # Pruning models (e.g. Qwen Efficient Video Sampling) append
+        # mrope-position channels to a variable-count encoder output and
+        # require a post-encoder recompute step; EC caches a fixed [N, D]
+        # tensor and can't carry that channel/step, so reject up front.
+        # TODO: support pruning if the position channels can be split and
+        #       recomputed on the cached tensor.
         if mm_config is not None and mm_config.is_multimodal_pruning_enabled():
             raise EncoderCacheLayoutError("UCM EC does not support multimodal pruning.")
 
@@ -322,7 +329,7 @@ class UCMECConnector(ECConnectorBase):
             device_id=self.device_id,
         )
 
-        self.req_to_identifiers: dict[str, tuple[str, ...]] = {}
+        self.req_to_state: dict[str, RequestState] = {}
         self.identifier_to_blocks: dict[str, IdentifierState] = {}
         self.step_verified_hits: set[str] = set()
         self.pending_loads: dict[str, ECLoadSpec] = {}
@@ -357,33 +364,34 @@ class UCMECConnector(ECConnectorBase):
     ) -> bool:
         del num_computed_tokens
         req_id = request.request_id
-        if req_id in self.req_to_identifiers:
+        request_state = self.req_to_state.get(req_id)
+        if request_state is None:
+            request_state = RequestState()
+        num_features = len(request.mm_features)
+        if num_features < request_state.processed_feature_count:
+            raise EncoderCacheLayoutError(
+                f"Encoder features cannot be removed from request {req_id!r}."
+            )
+        # Streaming updates append features; previously validated items are stable.
+        if num_features == request_state.processed_feature_count:
             return True
 
-        request_states: dict[str, IdentifierState] = {}
-        for index, feature in enumerate(request.mm_features):
+        registered_states = request_state.identifier_states
+        new_states: dict[str, IdentifierState] = {}
+        for index in range(request_state.processed_feature_count, num_features):
+            feature = request.mm_features[index]
             identifier = feature.identifier
+            # Rows in the encoder cache tensor stored under `identifier`
+            # (i.e. its first dimension).
             num_embeds = int(request.get_num_encoder_embeds(index))
 
-            state = request_states.get(identifier)
-            if state is not None:
-                if state.num_embeds != num_embeds:
-                    raise EncoderCacheLayoutError(
-                        f"Identifier {identifier!r} has inconsistent row counts "
-                        f"within request {req_id!r}: {state.num_embeds} and "
-                        f"{num_embeds}."
-                    )
-                continue
+            # Both previous batches and this batch refer to the same state type.
+            state = registered_states.get(identifier) or new_states.get(identifier)
+            seen_in_request = state is not None
+            if state is None:
+                state = self.identifier_to_blocks.get(identifier)
 
-            state = self.identifier_to_blocks.get(identifier)
-            if state is not None:
-                if state.num_embeds != num_embeds:
-                    raise EncoderCacheLayoutError(
-                        f"Identifier {identifier!r} has inconsistent row counts "
-                        f"across active requests: {state.num_embeds} and "
-                        f"{num_embeds}."
-                    )
-            else:
+            if state is None:
                 state = IdentifierState(
                     num_embeds=num_embeds,
                     chunk_ids=make_chunk_ids(
@@ -394,13 +402,27 @@ class UCMECConnector(ECConnectorBase):
                         hasher=self._block_hasher,
                     ),
                 )
-            request_states[identifier] = state
+            elif state.num_embeds != num_embeds:
+                scope = (
+                    f"within request {req_id!r}"
+                    if seen_in_request
+                    else "across active requests"
+                )
+                raise EncoderCacheLayoutError(
+                    f"Identifier {identifier!r} has inconsistent row counts "
+                    f"{scope}: {state.num_embeds} and {num_embeds}."
+                )
 
-        identifiers = tuple(request_states)
-        self.req_to_identifiers[req_id] = identifiers
-        for identifier, candidate in request_states.items():
+            if not seen_in_request:
+                new_states[identifier] = state
+
+        # Commit only after the entire appended batch has passed validation.
+        for identifier, candidate in new_states.items():
             state = self.identifier_to_blocks.setdefault(identifier, candidate)
             state.request_ref_count += 1
+            registered_states[identifier] = state
+        request_state.processed_feature_count = num_features
+        self.req_to_state[req_id] = request_state
         return True
 
     def has_cache_item(self, identifier: str) -> bool:
@@ -439,8 +461,19 @@ class UCMECConnector(ECConnectorBase):
         self,
         scheduler_output: SchedulerOutput,
     ) -> UCMECConnectorMetadata:
-        del scheduler_output
-        metadata = UCMECConnectorMetadata(loads=self.pending_loads)
+        # A surviving request may share a pending item through the local cache
+        # manager without an allocation callback of its own.
+        needed_identifiers: set[str] = set()
+        for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
+            if num_tokens > 0 and (state := self.req_to_state.get(req_id)) is not None:
+                needed_identifiers.update(state.identifier_states)
+        metadata = UCMECConnectorMetadata(
+            loads={
+                identifier: spec
+                for identifier, spec in self.pending_loads.items()
+                if identifier in needed_identifiers
+            }
+        )
         self.pending_loads = {}
         self.step_verified_hits.clear()
         return metadata
@@ -449,11 +482,11 @@ class UCMECConnector(ECConnectorBase):
         self,
         request: Request,
     ) -> tuple[bool, dict[str, Any] | None]:
-        identifiers = self.req_to_identifiers.pop(request.request_id, None)
-        if identifiers is None:
+        request_state = self.req_to_state.pop(request.request_id, None)
+        if request_state is None:
             return False, None
 
-        for identifier in identifiers:
+        for identifier in request_state.identifier_states:
             state = self.identifier_to_blocks.get(identifier)
             if state is None:
                 continue
@@ -619,7 +652,7 @@ class UCMECConnector(ECConnectorBase):
     def shutdown(self) -> None:
         self.pending_loads.clear()
         self.step_verified_hits.clear()
-        self.req_to_identifiers.clear()
+        self.req_to_state.clear()
         self.identifier_to_blocks.clear()
         self.clear_connector_metadata()
 

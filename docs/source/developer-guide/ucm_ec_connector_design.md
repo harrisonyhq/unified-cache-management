@@ -319,7 +319,13 @@ class IdentifierState:
     request_ref_count: int = 0
 
 
-req_to_identifiers: dict[str, tuple[str, ...]]
+@dataclass(slots=True)
+class RequestState:
+    processed_feature_count: int = 0
+    identifier_states: dict[str, IdentifierState] = field(default_factory=dict)
+
+
+req_to_state: dict[str, RequestState]
 identifier_to_blocks: dict[str, IdentifierState]
 
 # 仅在一个 scheduler step 内有效，只记录 positive hit
@@ -357,63 +363,124 @@ Scheduler 活跃请求数和每请求媒体数约束，不需要长期 LRU state
 
 ### 8.3 `ensure_cache_available()`
 
-职责只有两个：
+本次修正原因：当前 vLLM streaming input 可以向同一个 request/session 的
+`mm_features` 追加媒体，request_id 不变。原实现仅检查请求是否登记过就直接返回，
+会漏掉新增 identifier；若该 identifier 恰好由其他请求登记，当前请求也没有计入引用，
+其他请求结束时可能过早释放其元数据。因此幂等判断改为“已经校验到哪个 feature”。
 
-1. 建立 `req_to_identifiers`；
-2. 为 request 的所有 mm feature 建立或校验 `identifier_to_blocks`。
+对应 vLLM 源码链路（行号基于当前本地版本，均位于
+[scheduler.py](D:/code/vllm/vllm/v1/core/sched/scheduler.py:2455)）：
 
-它不调用 Store lookup；只在 request 首次注册时增加一次 request ref count。
+```text
+add_request(request)                                      # L2455
+  → 按 request_id 找到已有 session，构造 StreamingUpdate
+  → 正在等待 streaming 输入：直接更新；否则放入 streaming_queue
+    → _handle_stopped_request() 取出排队更新               # L2313
+  → _update_request_as_session(session, update)            # L1545
+    → 调整新增媒体的 mm_position.offset
+    → session.mm_features.extend(update.mm_features)       # L1572
+  → 后续 schedule() 的 waiting 路径                        # L959 / L981
+    → _ec_transfer_pending()                              # L2277
+      → ec_connector.ensure_cache_available(request, ...) # L2282
+```
+
+这里复用原 session 对象及 request_id，只追加 feature；它是 streaming **输入**续接，
+不是普通的流式输出 token。因此 connector 不能仅凭 request_id 已登记就跳过新增媒体。
+
+`req_to_state` 持久记录每个请求的处理进度；其中 `identifier_states` 保存已登记 identifier
+到共享 IdentifierState 对象的引用，替换原 `req_to_identifiers`。`identifier_to_blocks`
+仍维护跨请求共享状态，同一 identifier 在各请求中引用同一个对象，不另存一份行数。
+
+循环采用统一流程：先从历史 `registered_states` 或本批次 `new_states` 取状态，均未找到
+再查全局共享表；不存在则构建，存在则只做一次行数校验。`seen_in_request` 表示该
+identifier 是否已在请求历史或当前批次出现，用于判断是否新增请求引用，以及冲突应报
+“请求内”还是“跨请求”。本轮不需要在不同来源的行数变量之间转换。
+
+`new_states` 只暂存本请求首次引用的状态，整批校验成功后才增加引用并写入历史登记。
+无追加时仍 O(1) 返回；有追加时只遍历新增 feature，无历史表复制。状态对象复用且 chunk
+IDs 只在全局尚无对应状态时生成；这些保持算法成本，实际耗时改善需运行环境测量。
+
+处理分为两阶段：先对新增 feature 去重和校验，全部成功后才提交新增引用及处理进度。
+与请求历史、当前追加批次、其他活跃请求的行数冲突都保留原异常语义；新增批次失败不会
+留下部分登记，也不会修改旧计数。请求级异常隔离放到第 11.6 节的后续专项。
 
 ```python
-def ensure_cache_available(request, num_computed_tokens):
+def ensure_cache_available(
+    self,
+    request: Request,
+    num_computed_tokens: int,
+) -> bool:
+    del num_computed_tokens
     req_id = request.request_id
-    if req_id in req_to_identifiers:
+    request_state = self.req_to_state.get(req_id)
+    if request_state is None:
+        request_state = RequestState()
+    num_features = len(request.mm_features)
+    if num_features < request_state.processed_feature_count:
+        raise EncoderCacheLayoutError(
+            f"Encoder features cannot be removed from request {req_id!r}."
+        )
+    # Streaming updates append features; previously validated items are stable.
+    if num_features == request_state.processed_feature_count:
         return True
 
-    request_states: dict[str, IdentifierState] = {}
-
-    # 第一遍：去重、校验并构造候选 state，不修改全局 ref count。
-    for index, feature in enumerate(request.mm_features):
+    registered_states = request_state.identifier_states
+    new_states: dict[str, IdentifierState] = {}
+    for index in range(request_state.processed_feature_count, num_features):
+        feature = request.mm_features[index]
         identifier = feature.identifier
-        num_embeds = request.get_num_encoder_embeds(index)
+        # Rows in the encoder cache tensor stored under `identifier`
+        # (i.e. its first dimension).
+        num_embeds = int(request.get_num_encoder_embeds(index))
 
-        state = request_states.get(identifier)
-        if state is not None:
-            if state.num_embeds != num_embeds:
-                raise EncoderCacheLayoutError(...)
-            continue
+        # Both previous batches and this batch refer to the same state type.
+        state = registered_states.get(identifier) or new_states.get(identifier)
+        seen_in_request = state is not None
+        if state is None:
+            state = self.identifier_to_blocks.get(identifier)
 
-        state = identifier_to_blocks.get(identifier)
-        if state is not None:
-            if state.num_embeds != num_embeds:
-                raise EncoderCacheLayoutError(...)
-        else:
+        if state is None:
             state = IdentifierState(
                 num_embeds=num_embeds,
                 chunk_ids=make_chunk_ids(
                     identifier=identifier,
                     num_embeds=num_embeds,
+                    layout=self.layout,
+                    cache_namespace=self.cache_namespace,
+                    hasher=self._block_hasher,
                 ),
             )
+        elif state.num_embeds != num_embeds:
+            scope = (
+                f"within request {req_id!r}"
+                if seen_in_request
+                else "across active requests"
+            )
+            raise EncoderCacheLayoutError(
+                f"Identifier {identifier!r} has inconsistent row counts "
+                f"{scope}: {state.num_embeds} and {num_embeds}."
+            )
 
-        request_states[identifier] = state
+        if not seen_in_request:
+            new_states[identifier] = state
 
-    # 第二遍只遍历去重后的 identifier，提交并增加 request ref count。
-    unique_identifiers = tuple(request_states)
-    req_to_identifiers[req_id] = unique_identifiers
-    for identifier, candidate in request_states.items():
-        state = identifier_to_blocks.setdefault(identifier, candidate)
+    # Commit only after the entire appended batch has passed validation.
+    for identifier, candidate in new_states.items():
+        state = self.identifier_to_blocks.setdefault(identifier, candidate)
         state.request_ref_count += 1
-
+        registered_states[identifier] = state
+    request_state.processed_feature_count = num_features
+    self.req_to_state[req_id] = request_state
     return True
 ```
 
-chunked prefill 不会生成新的 request；多次 prefill 使用同一个 `request_id`。因此上述
-`req_id in req_to_identifiers` 保证幂等，不会重复更新或无限增加状态。
+例如请求最初为 `[X, X]`，X 只增加一次引用；追加 `[X, Y, Y]` 后 X 不变、Y 增加一次；
+再次 ensure 无新增 feature 时不再遍历，finish 时对 X、Y 各释放一次。
 
-本期假设 request 被 Scheduler 接纳后 `mm_features` 不发生原地变化。若未来支持同一
-request id 动态追加媒体，需要将 request 的 `(identifier, N)` signature 存入状态，
-检测并增量更新，不能直接按 request id 跳过。
+`num_computed_tokens` 继续不参与元数据登记，本 step 实际使用的 feature 由 Scheduler
+选择。本实现依赖 append-only 契约：历史 feature 已校验后不变；列表缩短抛出布局异常，
+等长替换或原地修改历史 feature 不在长度快速路径的支持范围，若上游允许此类更新需增加
+显式版本或更新通知。最初没有媒体的请求，之后追加媒体仍可正常登记。
 
 ### 8.4 `has_cache_item(identifier)`
 
@@ -510,40 +577,67 @@ class UCMECConnectorMetadata(ECConnectorMetadata):
     loads: dict[str, ECLoadSpec]
 ```
 
-`build_connector_meta()` 将 pending load 状态移动到 metadata，而不是复制后继续保留：
+本次修正原因：Scheduler 可能撤销本 step 已选择的请求，例如 priority 抢占路径。
+原实现忽略 scheduler_output，将全部 pending_loads 发给 Worker，导致已撤销请求仍触发
+无效加载。因此提交 metadata 前，按最终 num_scheduled_tokens 中 token 数大于 0 的请求，
+汇总它们登记的 identifier，只保留仍有最终请求引用的 pending load。
+
+不能只按最初触发加载的请求判断：另一请求可能通过 encoder_cache_manager 的本地命中
+共享该待加载 item，没有自己的 update_state_after_alloc 回调。原请求被撤销、共享请求
+仍被调度时，必须保留 load。使用最终请求的 identifier 并集覆盖这种情况。
 
 ```python
-meta = UCMECConnectorMetadata(
-    loads=pending_loads,
-)
-pending_loads = {}
-step_verified_hits.clear()
-return meta
+def build_connector_meta(
+    self,
+    scheduler_output: SchedulerOutput,
+) -> UCMECConnectorMetadata:
+    # A surviving request may share a pending item through the local cache
+    # manager without an allocation callback of its own.
+    needed_identifiers: set[str] = set()
+    for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
+        if num_tokens > 0 and (state := self.req_to_state.get(req_id)) is not None:
+            needed_identifiers.update(state.identifier_states)
+    metadata = UCMECConnectorMetadata(
+        loads={
+            identifier: spec
+            for identifier, spec in self.pending_loads.items()
+            if identifier in needed_identifiers
+        }
+    )
+    self.pending_loads = {}
+    self.step_verified_hits.clear()
+    return metadata
 ```
 
-即使 `loads` 为空，connector 启用时也应返回空 metadata 对象而不是 `None`，以便
-producer Worker 进入 EC wrapper，在 encoder forward 后触发 `save_caches()`。
+metadata.loads 使用新的字典，step 查询状态和 pending_loads 随后清空；不会修改已交给
+Worker 的 metadata。过滤加载计划不减少被抢占请求的长期 identifier 引用。
+
+这是保守的请求级过滤：最终请求包含某 identifier，即使它不在该请求本步 token 窗口内，
+仍可保留对应 load。它消除无最终请求引用的加载，不承诺 feature/token 窗口级最小 I/O；
+精确过滤需要 Scheduler 提供最终实际 encoder 需求。
+
+即使 loads 为空也返回 metadata 对象，使 producer Worker 能进入 EC wrapper 并保存输出。
 
 ### 8.7 请求完成、abort 和 preemption
 
 最终完成、abort 和 cancel 都会进入 vLLM 的 request finish/free 路径：
 
 ```python
-def request_finished(request):
-    identifiers = req_to_identifiers.pop(request.request_id, None)
-    if identifiers is None:
-        # finish hook 必须幂等，避免重复 decrement。
+def request_finished(
+    self,
+    request: Request,
+) -> tuple[bool, dict[str, Any] | None]:
+    request_state = self.req_to_state.pop(request.request_id, None)
+    if request_state is None:
         return False, None
 
-    for identifier in identifiers:
-        state = identifier_to_blocks.get(identifier)
+    for identifier in request_state.identifier_states:
+        state = self.identifier_to_blocks.get(identifier)
         if state is None:
             continue
-        assert state.request_ref_count > 0
         state.request_ref_count -= 1
-        if state.request_ref_count == 0:
-            identifier_to_blocks.pop(identifier, None)
-
+        if state.request_ref_count <= 0:
+            del self.identifier_to_blocks[identifier]
     return False, None
 ```
 
@@ -553,9 +647,11 @@ def request_finished(request):
 Preemption 不是请求完成：
 
 - request id 不变；
-- `req_to_identifiers` 保留；
-- 再次进入 waiting 时 `ensure_cache_available()` 幂等返回；
+- `req_to_state` 保留；
+- 再次进入 waiting 时，无新增 feature 则幂等返回，有追加则增量登记；
 - 不重复创建 request 元数据。
+
+shutdown 同时清空 req_to_state、identifier_to_blocks 和 step 状态。
 
 ## 9. Worker 数据路径
 
@@ -907,16 +1003,58 @@ Worker 直接以实际 tensor 的第一维作为 `N` 生成 key。若它与 Sche
 推导出的 `N` 不一致，后续 Scheduler 会使用另一个 `N` 生成 chunk ids，从而表现为
 miss，不会把错误形状的数据命中为合法 EC。
 
+### 11.6 后续专项：Load failure 与请求错误隔离（尚未实施）
+
+本次只实施第 8 节的 streaming 增量登记和最终加载过滤。以下处理放到下一专项，
+现有请求校验异常、has_cache_item 查询证据和 Worker load/save 失败行为尚未改变。
+
+**请求布局错误隔离。** 当前 ensure 中的 EncoderCacheLayoutError 没有请求级捕获，
+在本地 vLLM 可传播至 EngineCore fatal error/shutdown。目标是让可归因到请求的错误
+只结束相关请求：同请求行数冲突失败当前请求；与共享状态冲突时拒绝当前冲突请求，
+不覆盖既有 state，也不连带失败其他请求。streaming 新增批次不提交，旧引用等 finish
+时统一释放。不能简单降级为 Store miss 后继续计算，本地 encoder cache 也按 identifier
+共享，绕过 Store 无法消除 shape 歧义。全局配置无效仍应启动失败。
+
+优先评估复用本地 vLLM 的 take_unavailable_requests → finish_requests(FINISHED_ERROR)：
+
+- failed_requests 保存失败标记和原因直到 finish；pending_failed_req_ids 保存待上报事件。
+- ensure 发现专用请求校验错误后登记失败并返回 False，不能只返回 False 导致永久等待。
+- take 仅取走待上报事件，保留失败标记，避免完成清理前重新登记。
+- request_finished 先清理失败状态，再处理“没有请求登记”的提前返回；有旧引用则各减一次。
+- 不宽泛捕获所有 Exception；输入冲突、内部不变量损坏和 I/O 错误分别定义策略。
+
+**Store/Worker load failure。** 先确认 Store 的失败保证和 vLLM 错误回传能力，再确定协议：
+
+- lookup 与 load 之间 reservation/pin 的范围；缺失 chunk 和 load/wait 失败必须可检测。
+- Worker 按 identifier 失败后，如何找到真正依赖它的请求，以及 TP/PP/PCP 多 rank 如何聚合。
+- 已跳过 encoder compute 后，是否还保留重算输入、在哪个阶段可以安全回退。
+- 无法重算时如何返回请求错误，避免从 start_load_caches 抛出并拖垮引擎。
+- 异步在途 batch、abort、抢占和失败回传交错时，何时可以释放资源。
+
+**查询证据边界。** 当前 step_verified_hits 仅添加，hit 后 miss 不撤销。专项需处理旧命中
+使计算路径产生 load 的风险，但撤销查询证据不能误删其他请求已经选择的 pending load。
+若 Scheduler 允许查询与分配交错，需要显式请求/feature 级决策。元数据引用计数和本次
+最终加载过滤都不能代替 Store pin，也不能解决 lookup-load 淘汰竞态。
+
+**错误返回与验证。** 首版可沿用 FINISHED_ERROR、日志记录 request_id/identifier/阶段/
+错误码及行数；现有接口仅传 ID，不会自动把详细原因传给客户端。结构化客户端错误需
+另行扩展；布局冲突不应描述为原样重试即可恢复。指标不使用 request_id/identifier 标签。
+验收覆盖：只有错误请求且零 scheduled tokens 也能结束；混合请求中健康请求继续；
+错误事件 take 后到 finish 前重复调度不重复计数；streaming/abort 不泄漏引用；部分 chunk
+与多 rank 失败不使用损坏 tensor；可重算与不可重算路径分别验证。目标 vLLM 版本需复核
+普通 step、batch queue 的消费时机；不能仅凭 connector 方法测试宣称服务级隔离完成。
+
 ## 12. 性能设计
 
 ### 12.1 Scheduler
 
-- `ensure_cache_available()` 做一次 O(M) feature 遍历和一次 O(U) 去重 identifier 提交；
+- `ensure_cache_available()` 首次遍历 M 个 feature；后续仅遍历追加的 ΔM，提交新增唯一 identifier；
+- 无追加时 O(1) 返回；chunk hash 成本与本次首次构建的 chunk 数有关；
 - chunk key 只在 identifier 首次被活跃 request 引用时生成一次；
 - request 内先去重 identifier，避免重复更新；
 - `store.lookup()` 一次批量查询一个 identifier 的所有 chunk；
 - 命中 identifier 只写入本 step 的 `step_verified_hits`；
-- `build_connector_meta()` 后立即清空，不把 hit 跨 step 缓存。
+- `build_connector_meta()` 汇总最终请求的 identifier 并过滤 pending loads，随后清空 step 状态。
 
 通常 M 很小，真正成本主要是 Store lookup，而不是 Python 遍历。
 
@@ -1012,7 +1150,7 @@ chunk 字节数为 `chunk_size * width * dtype.itemsize`。
 | `ensure_cache_available` | 幂等建立 request/identifier state，不 lookup |
 | `has_cache_item` | 批量 lookup 全部 chunk，只有全命中才返回 true |
 | `update_state_after_alloc` | 将外部命中的 item 加入本 step load metadata |
-| `build_connector_meta` | 冻结并发送本 step load metadata，清 step cache |
+| `build_connector_meta` | 按最终已调度请求过滤 load metadata，清 step cache |
 | `bind_connector_metadata` | Worker 绑定本 step metadata |
 | `register_caches` | 当前无调用点且不需要预注册 vLLM EC dict，保持 no-op |
 | `start_load_caches` | 同步版本 padded storage + 同步 wait；Phase 2B stream/event 异步 load |
@@ -1069,6 +1207,14 @@ has_cache_item(identifier)
 
 ## 16. 测试方案
 
+EC 配置、layout 和 Scheduler 状态测试统一放在 `test/test_ucm_ec_config.py`。
+本次新增 11 个状态用例：追加登记/去重/跨请求共享、无追加快速返回、空请求追加、
+三类行数冲突不部分提交、列表缩短、最终调度过滤、无 alloc 回调的共享请求保留 load、
+空调度、finish/shutdown 和跨 step 清理。
+这些用例已在实际 connector 源码与依赖替身环境中通过；本机标准导入缺少 wrapt，
+也未安装 torch/vLLM，真实 Scheduler/Worker/Store 集成结果待验证。
+
+
 ### 16.1 Layout 单元测试
 
 - 普通布局调用 vLLM 通用输入宽度接口；
@@ -1095,7 +1241,7 @@ has_cache_item(identifier)
 - 重复调用 ensure 幂等；
 - chunked prefill 不重复增加 request 状态；
 - preemption 保留 request 状态；
-- finish、abort、cancel 清理 `req_to_identifiers`；
+- finish、abort、cancel 清理 `req_to_state`；
 - 一个共享 identifier 的 request 结束后，其余 request 仍可查询 state；
 - 最后一个 request 结束后删除 `identifier_to_blocks` entry；
 - 活跃 request 的 state 仍在时发生 Store GC，`has_cache_item` 返回 miss；
@@ -1195,8 +1341,9 @@ chunk_bytes / cache_namespace / pipeline / dp rank / save rank
 - 同 step 批量多个 identifier；
 - lookup/prefetch 联动。
 
-### Phase 3：Load failure 自动重算与一致性增强
+### Phase 3：Load failure、请求错误隔离与一致性增强
 
+- 按第 11.6 节统一设计请求布局错误隔离与 load failure；此项尚未实施；
 - 扩展 vLLM Scheduler/Model Runner 的 EC load-failure 协议；
 - 失败 item 不进入模型消费，释放失败 allocation；
 - 下一 step 强制作为 external miss 调度 encoder compute；
