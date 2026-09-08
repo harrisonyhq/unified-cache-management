@@ -434,8 +434,10 @@ class UCMECConnector(ECConnectorBase):
         if self.store is None:
             raise RuntimeError("UCM EC store is closed.")
 
-        found = self.store.lookup(list(state.chunk_ids))
-        hit = len(found) == len(state.chunk_ids) and all(bool(item) for item in found)
+        # Full-item hit: the contiguous present prefix must reach the last
+        # chunk; -1 (nothing present) never matches since len >= 1.
+        last = self.store.lookup_on_prefix(list(state.chunk_ids))
+        hit = last == len(state.chunk_ids) - 1
         if hit:
             self.step_verified_hits.add(identifier)
         return hit

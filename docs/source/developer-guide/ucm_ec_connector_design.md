@@ -47,7 +47,7 @@ check(task) -> bool
 5. Scheduler 在 `ensure_cache_available()` 中建立请求和 identifier 的内存元数据，
    但不执行 Store lookup。
 6. `has_cache_item(identifier)` 根据内存中的 identifier state 取得全部 chunk key，调用
-   `store.lookup(chunk_ids)`；只有所有 chunk 都存在才算 EC 命中。
+   `store.lookup_on_prefix(chunk_ids)`；返回值到达最后一个 chunk 的下标才算 EC 命中。
 7. Worker 以一个完整 identifier 的所有 chunk 为一次逻辑 load/dump 单元。
 8. `identifier_to_blocks` 的每个 entry 维护 request 级 ref count，用于在最后一个
    活跃请求不再引用 identifier 时立即删除其 state。
@@ -494,23 +494,32 @@ def has_cache_item(identifier):
     state = identifier_to_blocks.get(identifier)
     if state is None:
         return False
-    found = store.lookup(list(state.chunk_ids))
-    hit = len(found) == len(state.chunk_ids) and all(found)
+    last = store.lookup_on_prefix(list(state.chunk_ids))
+    hit = last == len(state.chunk_ids) - 1
     if hit:
         step_verified_hits.add(identifier)
     return hit
 ```
 
-命中语义是 exact item hit，不使用 `lookup_on_prefix()`：
+命中语义是 exact item hit。`lookup_on_prefix()` 在这里只作为“全部 chunk 命中”的
+谓词使用：返回值等于最后一个 chunk 的下标（`len - 1`）等价于 `lookup()` 返回
+全 true；部分前缀命中（返回值落在 `-1` 到 `len - 2` 之间）一律判 miss，不做
+前缀复用：
 
 ```text
-[true, true, true]  -> hit
-[true, true, false] -> miss
-[false, false]      -> miss
+chunks [T, T, T] -> lookup_on_prefix 返回 2 == len-1 -> hit
+chunks [T, T, F] -> lookup_on_prefix 返回 1          -> miss
+chunks [F, F]    -> lookup_on_prefix 返回 -1         -> miss
 ```
 
 EC 不能像文本 prefix KV 一样复用前几个 chunk，因为缺失任何 encoder embedding 都
 无法构造完整的 item 输出。
+
+选用 `lookup_on_prefix()` 而非 `lookup()` 是纯性能考量，命中/miss 语义完全等价：
+`lookup()` 会把逐 chunk 的 bool 数组回传到 Python 侧再做聚合，`lookup_on_prefix()`
+只回传一个 int，Python 侧只需一次下标比较；C++ 侧两条路径成本相同——Posix 的
+`Lookup()` 本身就由 `LookupOnPrefix()` 实现（先并行扫描定位第一个缺失，再回填
+前缀），Cache 层两个 `*Fast` 路径都先做同一遍 buffer `Exist()`。
 
 `step_verified_hits` 只连接同一个调度 step 内的 `has_cache_item()` 与
 `update_state_after_alloc()`；必须在 `build_connector_meta()` 中清空，不能跨 step
@@ -952,8 +961,9 @@ Posix 层可以跨 DP 域共享。chunk key 默认不包含 DP rank，从而允�
 
 ### 11.1 部分写入
 
-Store 可能在 dump 完成前已经能查到部分 chunk。全量 `all(found)` 保证此时仍为 miss。
-只有所有 chunk 可见后，item 才成为命中。
+Store 可能在 dump 完成前已经能查到部分 chunk。`lookup_on_prefix()` 的返回值只有
+在所有 chunk 可见时才会到达最后一个 chunk 的下标，部分可见仍判 miss；只有所有
+chunk 可见后，item 才成为命中。
 
 ### 11.2 GC 和淘汰
 
@@ -962,8 +972,8 @@ Store 可能在 dump 完成前已经能查到部分 chunk。全量 `all(found)` 
 ```text
 identifier state 仍存在
   -> has_cache_item()
-  -> store.lookup(all chunk ids)
-  -> 至少一个 false
+  -> store.lookup_on_prefix(all chunk ids)
+  -> 返回值停在第一个缺失 chunk 之前
   -> external miss
   -> 重新执行 encoder
 ```
@@ -1052,7 +1062,8 @@ miss，不会把错误形状的数据命中为合法 EC。
 - 无追加时 O(1) 返回；chunk hash 成本与本次首次构建的 chunk 数有关；
 - chunk key 只在 identifier 首次被活跃 request 引用时生成一次；
 - request 内先去重 identifier，避免重复更新；
-- `store.lookup()` 一次批量查询一个 identifier 的所有 chunk；
+- `store.lookup_on_prefix()` 一次批量查询一个 identifier 的所有 chunk，返回连续
+  命中前缀的末尾下标；
 - 命中 identifier 只写入本 step 的 `step_verified_hits`；
 - `build_connector_meta()` 汇总最终请求的 identifier 并过滤 pending loads，随后清空 step 状态。
 
@@ -1148,7 +1159,7 @@ chunk 字节数为 `chunk_size * width * dtype.itemsize`。
 |---|---|
 | `__init__` | 解析 layout，初始化配置指定的唯一 Store |
 | `ensure_cache_available` | 幂等建立 request/identifier state，不 lookup |
-| `has_cache_item` | 批量 lookup 全部 chunk，只有全命中才返回 true |
+| `has_cache_item` | `lookup_on_prefix` 全 chunk 命中谓词（返回值 == len-1） |
 | `update_state_after_alloc` | 将外部命中的 item 加入本 step load metadata |
 | `build_connector_meta` | 按最终已调度请求过滤 load metadata，清 step cache |
 | `bind_connector_metadata` | Worker 绑定本 step metadata |
@@ -1173,7 +1184,7 @@ Request enters waiting
        -> build identifier states and chunk ids
   -> scheduler scans encoder inputs
        -> has_cache_item(identifier)
-            -> store.lookup(all chunk ids) == all true
+            -> store.lookup_on_prefix(all chunk ids) == len-1
   -> allocate local vLLM encoder cache entry
   -> update_state_after_alloc()
        -> pending_loads[identifier] = ECLoadSpec(N, chunk_ids)
@@ -1313,7 +1324,7 @@ chunk_bytes / cache_namespace / pipeline / dp rank / save rank
 - 单 Store `Cache|Posix`；
 - 固定行数 chunk；
 - Scheduler 两张 map；
-- `has_cache_item()` 全 chunk lookup；
+- `has_cache_item()` 基于 `lookup_on_prefix()` 的全 chunk 命中判断；
 - Worker 同步 load/dump；
 - load 只有在 `wait()` 成功后才插入 encoder cache；失败时 fail closed；
 - dump 失败记录日志/指标，不影响当前请求；

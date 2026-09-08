@@ -22,7 +22,7 @@ UCM representation
 - `D`、dtype 和 `R=rows_per_chunk` 在服务启动时确定。
 - chunk ID 使用 UCM 现有 hash/block-id 方法生成，不新增 hash 实现。
 - Scheduler 维护 `request -> identifiers` 和 `identifier -> chunk IDs`。
-- `has_cache_item()` 每次调度 step 对 Store 做真实 lookup。
+- `has_cache_item()` 每次调度 step 对 Store 做真实 `lookup_on_prefix()` 查询。
 - `update_state_after_alloc()` 只把已经被 Scheduler 选中且外部命中的 item
   写入本 step metadata。
 - Worker load 时分配完整 padded storage `[K,R,D]`，load 完后以
@@ -419,8 +419,10 @@ def has_cache_item(self, identifier: str) -> bool:
     if state is None:
         return False
 
-    found = self.store.lookup(list(state.chunk_ids))
-    hit = len(found) == len(state.chunk_ids) and all(found)
+    # 前缀扫描只作为“全部 chunk 命中”的谓词：返回值到达最后一个 chunk 的
+    # 下标（len-1）等价于 lookup() 返回全 true；部分前缀命中一律判 miss。
+    last = self.store.lookup_on_prefix(list(state.chunk_ids))
+    hit = last == len(state.chunk_ids) - 1
 
     if hit:
         self.step_verified_hits.add(identifier)
@@ -933,7 +935,7 @@ Worker encoder forward
 
 ```text
 ensure request state
-    -> Store lookup 所有 chunk 均命中
+    -> Store lookup_on_prefix 到达最后一个 chunk（全命中）
     -> step_verified_hits.add(identifier)
     -> Scheduler allocate
     -> update_state_after_alloc
@@ -948,7 +950,7 @@ ensure request state
 
 ```text
 ensure request state
-    -> Store lookup miss
+    -> Store lookup_on_prefix miss
     -> Scheduler allocate 并安排 encoder compute
     -> update_state_after_alloc no-op
     -> Worker 执行 encoder
@@ -965,7 +967,7 @@ ensure request state
 |---|---|---|
 | `__init__` | 两侧 | 解析 layout，创建同一逻辑 Store 的进程内 handle |
 | `ensure_cache_available` | Scheduler | 两遍建立 request/identifier state，幂等 |
-| `has_cache_item` | Scheduler | lookup 全部 chunk，命中写入 step hit set |
+| `has_cache_item` | Scheduler | `lookup_on_prefix` 全命中谓词，命中写入 step hit set |
 | `update_state_after_alloc` | Scheduler | allocate 后将 hit item 加入 pending loads |
 | `build_connector_meta` | Scheduler | 生成 load metadata，清空 step 状态 |
 | `request_finished` | Scheduler | 清 request map，递减 identifier ref count |

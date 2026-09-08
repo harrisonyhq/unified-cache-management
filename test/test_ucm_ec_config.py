@@ -312,7 +312,7 @@ class ECConnectorStateTest(unittest.TestCase):
             side_effect=lambda value: hashlib.sha256(repr(value).encode()).digest()
         )
         self.connector.store = Mock()
-        self.connector.store.lookup.side_effect = lambda ids: [True] * len(ids)
+        self.connector.store.lookup_on_prefix.side_effect = lambda ids: len(ids) - 1
 
     def ensure(self, request):
         self.assertTrue(self.connector.ensure_cache_available(request, 0))
