@@ -1,4 +1,4 @@
-"""EC configuration, layout and scheduler state tests; no device or Store I/O."""
+"""EC configuration, state and batched loads; CPU tensors and mocked Store I/O."""
 
 import copy
 import hashlib
@@ -295,6 +295,115 @@ class FakeRequest:
 
     def get_num_encoder_embeds(self, index):
         return self.mm_features[index].rows
+
+
+class ECConnectorLoadTest(unittest.TestCase):
+    def setUp(self):
+        self.connector = ec.UCMECConnector.__new__(ec.UCMECConnector)
+        self.connector.device = torch.device("cpu")
+        self.connector.layout = ec.EncoderCacheLayout(
+            width=2, dtype=torch.float32, rows_per_chunk=3, chunk_bytes=24
+        )
+        self.connector._connector_metadata = ec.UCMECConnectorMetadata(
+            loads={
+                "A": ec.ECLoadSpec(num_embeds=4, chunk_ids=(b"A0", b"A1")),
+                "B": ec.ECLoadSpec(num_embeds=3, chunk_ids=(b"B0",)),
+                "C": ec.ECLoadSpec(num_embeds=2, chunk_ids=(b"C0",)),
+            }
+        )
+        self.cache = {}
+        self.events = []
+        self.destinations = {}
+        self.submit_failure = None
+        self.wait_failures = set()
+        self.failure = RuntimeError("injected Store failure")
+        self.connector.store = Mock()
+        self.connector.store.load.side_effect = self.load
+        self.connector.store.wait.side_effect = self.wait
+
+    def load(self, chunk_ids, shard_indices, destinations):
+        identifier = chr(chunk_ids[0][0])
+        self.events.append(("load", identifier))
+        self.assertEqual(shard_indices, [0] * len(chunk_ids))
+        if identifier == self.submit_failure:
+            raise self.failure
+        self.destinations[identifier] = destinations
+        return identifier
+
+    def wait(self, identifier):
+        self.events.append(("wait", identifier))
+        # A destination must not be exposed before its transfer completes.
+        self.assertNotIn(identifier, self.cache)
+        if identifier in self.wait_failures:
+            raise self.failure
+        for index, (tensor,) in enumerate(self.destinations[identifier]):
+            tensor.fill_(ord(identifier) + index)
+
+    def test_submits_batch_before_waiting_and_publishes_unpadded_tensors(self):
+        resident = torch.ones(1, 2)
+        self.cache["B"] = resident
+        self.connector.start_load_caches(self.cache)
+
+        self.assertEqual(
+            self.events, [("load", "A"), ("load", "C"), ("wait", "A"), ("wait", "C")]
+        )
+        self.assertIs(self.cache["B"], resident)
+        torch.testing.assert_close(
+            self.cache["A"], torch.tensor([[65.0, 65.0]] * 3 + [[66.0, 66.0]])
+        )
+        torch.testing.assert_close(self.cache["C"], torch.full((2, 2), 67.0))
+
+    def test_submission_errors_drain_earlier_tasks_and_preserve_original_error(self):
+        for failure_kind in ("submit", "metadata", "allocation", "submit_and_wait"):
+            with self.subTest(failure_kind=failure_kind):
+                self.setUp()
+                expected_type = ec.UCMEncoderCacheError
+                if failure_kind == "metadata":
+                    self.connector._connector_metadata.loads["B"] = ec.ECLoadSpec(
+                        num_embeds=4, chunk_ids=(b"B0",)
+                    )
+                    expected_type = ec.EncoderCacheLayoutError
+                elif failure_kind == "allocation":
+                    expected_type = MemoryError
+                else:
+                    self.submit_failure = "B"
+                if failure_kind == "submit_and_wait":
+                    self.wait_failures.add("A")
+
+                allocate = torch.empty
+
+                def allocate_or_fail(shape, **kwargs):
+                    if failure_kind == "allocation" and self.destinations:
+                        raise MemoryError("injected allocation failure")
+                    return allocate(shape, **kwargs)
+
+                with patch.object(ec.torch, "empty", side_effect=allocate_or_fail):
+                    with self.assertRaises(expected_type) as caught:
+                        self.connector.start_load_caches(self.cache)
+
+                waits = [
+                    identifier for event, identifier in self.events if event == "wait"
+                ]
+                self.assertEqual(waits, ["A"])
+                self.assertNotIn("B", self.cache)
+                self.assertNotIn("C", self.cache)
+                self.assertEqual("A" in self.cache, not self.wait_failures)
+                if expected_type is ec.UCMEncoderCacheError:
+                    self.assertEqual(caught.exception.identifier, "B")
+                    self.assertIs(caught.exception.__cause__, self.failure)
+
+    def test_wait_errors_drain_all_tasks_and_only_publish_successful_items(self):
+        self.wait_failures = {"A", "B"}
+        with self.assertRaises(ec.UCMEncoderCacheError) as caught:
+            self.connector.start_load_caches(self.cache)
+        self.assertEqual(
+            self.events,
+            [("load", key) for key in "ABC"] + [("wait", key) for key in "ABC"],
+        )
+        self.assertEqual(caught.exception.identifier, "A")
+        self.assertIs(caught.exception.__cause__, self.failure)
+        self.assertEqual(set(self.cache), {"C"})
+        torch.testing.assert_close(self.cache["C"], torch.full((2, 2), 67.0))
 
 
 class ECConnectorStateTest(unittest.TestCase):

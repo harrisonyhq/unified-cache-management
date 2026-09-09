@@ -1,8 +1,9 @@
 """UCM-backed vLLM encoder-cache connector.
 
-The connector uses synchronous Store I/O. An encoder-cache item is a
-variable-length ``[N, D]`` tensor, while UCM stores fixed-size blocks, so each
-item is represented by one or more fixed-row chunks. Scheduler state carries
+The connector submits batch loads before waiting synchronously for completion.
+An encoder-cache item is a variable-length ``[N, D]`` tensor, while UCM stores
+fixed-size blocks, so each item is represented by one or more fixed-row chunks.
+Scheduler state carries
 only the chunk IDs required by a selected external hit; workers reconstruct
 the tensor from padded chunk storage or dump a newly computed tensor.
 """
@@ -41,7 +42,7 @@ from ucm.integration.vllm.ucm_connector import (
 )
 from ucm.logger import init_logger
 from ucm.store.factory_v1 import UcmConnectorFactoryV1
-from ucm.store.ucmstore_v1 import UcmKVStoreBaseV1
+from ucm.store.ucmstore_v1 import Task, UcmKVStoreBaseV1
 from ucm.utils import Config
 
 if TYPE_CHECKING:
@@ -522,39 +523,57 @@ class UCMECConnector(ECConnectorBase):
 
         rows = self.layout.rows_per_chunk
         width = self.layout.width
-        for identifier, spec in metadata.loads.items():
-            if identifier in encoder_cache:
-                continue
-            expected_chunks = (
-                spec.num_embeds + self.layout.rows_per_chunk - 1
-            ) // self.layout.rows_per_chunk
-            if spec.num_embeds <= 0 or len(spec.chunk_ids) != expected_chunks:
-                raise EncoderCacheLayoutError(
-                    f"Invalid load metadata for {identifier!r}: "
-                    f"num_embeds={spec.num_embeds}, chunks={len(spec.chunk_ids)}, "
-                    f"expected_chunks={expected_chunks}."
-                )
+        pending: list[tuple[str, ECLoadSpec, torch.Tensor, Task]] = []
+        wait_error: tuple[str, Exception] | None = None
+        try:
+            for identifier, spec in metadata.loads.items():
+                if identifier in encoder_cache:
+                    continue
+                expected_chunks = (spec.num_embeds + rows - 1) // rows
+                if spec.num_embeds <= 0 or len(spec.chunk_ids) != expected_chunks:
+                    raise EncoderCacheLayoutError(
+                        f"Invalid load metadata for {identifier!r}: "
+                        f"num_embeds={spec.num_embeds}, chunks={len(spec.chunk_ids)}, "
+                        f"expected_chunks={expected_chunks}."
+                    )
 
-            storage = torch.empty(
-                (expected_chunks, rows, width),
-                dtype=self.layout.dtype,
-                device=self.device,
-            )
-            dst_chunks = [[storage[index]] for index in range(expected_chunks)]
-            try:
-                task = self.store.load(
-                    list(spec.chunk_ids),
-                    [0] * expected_chunks,
-                    dst_chunks,
+                storage = torch.empty(
+                    (expected_chunks, rows, width),
+                    dtype=self.layout.dtype,
+                    device=self.device,
                 )
-                self.store.wait(task)
-            except Exception as exc:
-                encoder_cache.pop(identifier, None)
-                raise UCMEncoderCacheError(
-                    identifier, "Failed to load encoder cache item"
-                ) from exc
+                dst_chunks = [[storage[index]] for index in range(expected_chunks)]
+                try:
+                    task = self.store.load(
+                        list(spec.chunk_ids),
+                        [0] * expected_chunks,
+                        dst_chunks,
+                    )
+                except Exception as exc:
+                    raise UCMEncoderCacheError(
+                        identifier, "Failed to load encoder cache item"
+                    ) from exc
+                pending.append((identifier, spec, storage, task))
+        finally:
+            # Retain destinations and drain every submitted task even if a later
+            # allocation/submission or an earlier wait fails.
+            for identifier, spec, storage, task in pending:
+                try:
+                    self.store.wait(task)
+                    encoder_cache[identifier] = storage.view(-1, width)[
+                        : spec.num_embeds
+                    ]
+                except Exception as exc:
+                    encoder_cache.pop(identifier, None)
+                    logger.exception("Failed to load EC item %s", identifier)
+                    if wait_error is None:
+                        wait_error = (identifier, exc)
 
-            encoder_cache[identifier] = storage.view(-1, width)[: spec.num_embeds]
+        if wait_error is not None:
+            identifier, cause = wait_error
+            raise UCMEncoderCacheError(
+                identifier, "Failed to load encoder cache item"
+            ) from cause
 
     def _validate_encoder_tensor(
         self,
