@@ -112,7 +112,7 @@ VllmConfig
   -> resolve_encoder_cache_layout()
   -> D / dtype / element_size
   -> rows_per_chunk / chunk_bytes
-  -> cache_namespace
+  -> build_ec_hash_meta() -> RequestHasher(meta)
   -> initialize configured UCM Store
 ```
 
@@ -162,8 +162,9 @@ class EncoderCacheLayout:
 `EncoderCacheLayout` 只描述 block 的物理解释方式（宽度、dtype、chunk 行数、
 字节数），不承载模型语义。模型标识、权重 revision 和会改变 encoder 输出的
 processor 配置由独立的部署 `cache_namespace` 隔离，而不是在每个 identifier
-状态中重复保存。`rows_per_chunk` 是唯一不被 `cache_namespace` 覆盖的 layout
-维度，因此它直接进入 chunk key（见第 7 节），不再额外计算中间摘要。
+状态中重复保存。`width`、`dtype` 和 `rows_per_chunk` 显式进入 chunk key（见第 7 节），
+不依赖模型身份间接保证布局一致。`deepstack_visual_indexes` 的完整有序列表进入
+namespace；即使层数相同，选取不同层也不能复用 EC。
 
 不能只依赖 `ModelConfig.compute_hash()`，因为它并不保证覆盖所有影响多模态
 encoder 输出的配置。
@@ -270,26 +271,35 @@ buffer。GDR 路径虽然存在未命中预注册范围时的按需 MR 注册，
 
 ### 7.1 Key 输入
 
-每个 chunk 的 block id 直接复用 UCM 现有 hash/block-id helper 生成，输出格式与
-UCM 当前 KV connector 保持一致：
+每个 chunk 的 block id 复用公共 `RequestHasher(meta: str)`，输出仍为 16 字节。
+EC 由 `build_ec_hash_meta()` 构造自己的 meta，不调用 KV 的 `build_kv_hash_meta()`：
 
 ```text
-chunk_id = ucm_hash_block_id(
-    cache_namespace,
+ec_hasher = RequestHasher(meta=build_ec_hash_meta(vllm_config, encoder_config))
+chunk_id = ec_hasher((
+    width,
+    str(dtype),
     rows_per_chunk,
     identifier,
     num_encoder_embeds,
     chunk_index
-)
+))
 ```
 
-`ucm_hash_block_id()` 是对 UCM 现有 helper 的薄封装；EC connector 不再自行实现
-`H128/blake2b`，也不引入第二套 block-id 格式。
+公共 hasher 只执行调用方指定的 meta 编码和哈希，不自行构造部署信息。
+TP size、TP/PCP/DP rank、speculative method/tokens 和 decoder sparse flags
+不作为 EC 哈希盐；namespace 仍保留已有的 multimodal 配置 hash。
 
-其中 `cache_namespace` 在 connector 启动时由模型、权重 revision 及影响 encoder
-输出的配置确定，或者由部署显式配置；它是 connector 级常量，不进入每个
-`IdentifierState`。`rows_per_chunk` 直接放进 key，使得同一 namespace 下不同 chunk
-粒度的部署生成不同 key，表现为 miss 而非加载错误行范围。
+其中 meta 的身份来源由模型、权重 revision 及现有 multimodal 配置 hash 确定，
+也可以由部署的 `cache_namespace` 显式指定。`build_ec_hash_meta()` 将
+`("ucm:ec:v2", identity_source, tuple(deepstack_visual_indexes or ()))` 编码为紧凑的
+JSON 字符串并直接传给 `RequestHasher`；显式 namespace 同样保留 deepstack 隔离。
+不再单独计算或传递 namespace 摘要。meta 是 connector 级常量，不进入每个
+`IdentifierState`。物理布局直接进入 chunk key，
+使不同 width、dtype 或 chunk 粒度的部署表现为 miss，而非误读不同布局的数据。
+
+这是一次 EC key 格式迁移：旧 key 不再命中，不回退尝试旧格式，以免绕过布局隔离。
+旧对象不会自动删除，交由原有回收机制处理；新旧版本并行期间各自使用自己的格式。
 
 必须把 `num_encoder_embeds` 放入 key。否则同一个 identifier 在异常情况下对应
 不同 `N` 时，较短对象可能错误命中较长对象的 chunk 前缀。
@@ -446,7 +456,6 @@ def ensure_cache_available(
                     identifier=identifier,
                     num_embeds=num_embeds,
                     layout=self.layout,
-                    cache_namespace=self.cache_namespace,
                     hasher=self._block_hasher,
                 ),
             )
@@ -995,7 +1004,7 @@ identifier state 仍存在
 
 ### 11.4 Producer/Consumer 配置不一致
 
-Producer 和 Consumer 的 `rows_per_chunk` 或 `cache_namespace` 不一致时，它们生成不同
+Producer 和 Consumer 的 width、dtype、`rows_per_chunk` 或 `cache_namespace` 不一致时，它们生成不同
 chunk key，因此表现为 miss，而不是加载错误 tensor。启动日志必须打印 namespace 和
 layout 各字段便于排查。
 
@@ -1137,9 +1146,10 @@ connector 相同的规则分割为路径列表。
 `store_unique_id` 使用 `.get()`，未配置时自动推导。显式 width 优先，实际 tensor 由 Worker 校验。
 仅在组装 Store 参数时浅拷贝一次 Store 配置，不深拷贝整个 YAML。
 
-`resolve_cache_namespace()` 直接组织模型、revision、HF commit、architecture 和 multimodal
-配置 hash，不再调用独立的模型 identity helper。显式 namespace 与自动 namespace 的
-hash 输入结构保持不变；模型名称仅用于缓存身份隔离，不参与宽度推导分支。
+`build_ec_hash_meta()` 直接组织模型、revision、HF commit、architecture 和 multimodal
+配置 hash，不再调用独立的模型 identity helper。自动或显式身份来源都与完整
+deepstack 层索引列表及 EC 格式标记一起构造 meta，哈希计算交给 `RequestHasher`；模型名称仅用于
+缓存身份隔离，不参与宽度推导分支。完整 key 公式和迁移行为见第 7 节。
 
 Store 的 `share_buffer_enable` 强制为 `True`，`local_rank_size` 直接覆盖为 TP size，
 与 KV connector 的 MLA 分支一致。`use_gdr` 强制为 `False`；用户配置中出现该键时
@@ -1311,7 +1321,7 @@ ucm_ec_tail_padding_bytes_total
 
 ```text
 model / revision / D / dtype / rows_per_chunk /
-chunk_bytes / cache_namespace / pipeline / dp rank / save rank
+chunk_bytes / hash_namespace (hasher seed) / pipeline / dp rank / save rank
 ```
 
 日志禁止输出原始图片数据；identifier 只打印短前缀。

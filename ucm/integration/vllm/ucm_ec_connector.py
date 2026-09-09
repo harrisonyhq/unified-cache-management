@@ -10,6 +10,7 @@ the tensor from padded chunk storage or dump a newly computed tensor.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -142,11 +143,11 @@ def resolve_encoder_cache_layout(
     )
 
 
-def resolve_cache_namespace(
+def build_ec_hash_meta(
     vllm_config: VllmConfig,
     encoder_config: dict[str, Any],
-    hasher: RequestHasher,
-) -> bytes:
+) -> str:
+    """Build EC identity metadata without KV-specific deployment settings."""
     explicit = encoder_config.get("cache_namespace")
     if explicit is not None:
         namespace_source: str | tuple = str(explicit)
@@ -164,7 +165,19 @@ def resolve_cache_namespace(
             tuple(getattr(hf_config, "architectures", None) or ()),
             mm_hash,
         )
-    return hasher(namespace_source)
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    vision_config = getattr(hf_config, "vision_config", None)
+    deepstack_indexes = tuple(
+        getattr(vision_config, "deepstack_visual_indexes", None) or ()
+    )
+    # Equal-width deepstack outputs can still contain different layer features.
+    # Keep this semantic salt even when the deployment supplies a namespace.
+    return json.dumps(
+        ("ucm:ec:v2", namespace_source, deepstack_indexes),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 def make_chunk_ids(
@@ -172,7 +185,6 @@ def make_chunk_ids(
     identifier: str,
     num_embeds: int,
     layout: EncoderCacheLayout,
-    cache_namespace: bytes,
     hasher: RequestHasher,
 ) -> tuple[bytes, ...]:
     if not identifier:
@@ -186,7 +198,8 @@ def make_chunk_ids(
     return tuple(
         hasher(
             (
-                cache_namespace,
+                layout.width,
+                str(layout.dtype),
                 layout.rows_per_chunk,
                 identifier,
                 num_embeds,
@@ -299,12 +312,11 @@ class UCMECConnector(ECConnectorBase):
 
         ec_config = Config.load_ec_config(vllm_config.ec_transfer_config)
         encoder_config = ec_config["encoder_cache_config"]
-        self._block_hasher = RequestHasher(vllm_config, 0)
+        self._block_hasher = RequestHasher(
+            meta=build_ec_hash_meta(vllm_config, encoder_config)
+        )
         self.layout = resolve_encoder_cache_layout(
             vllm_config, encoder_config
-        )
-        self.cache_namespace = resolve_cache_namespace(
-            vllm_config, encoder_config, self._block_hasher
         )
 
         self.local_rank = (
@@ -346,7 +358,7 @@ class UCMECConnector(ECConnectorBase):
         logger.info(
             "Initialized UCM EC connector: role=%s, producer=%s, consumer=%s, "
             "width=%s, dtype=%s, rows_per_chunk=%s, chunk_bytes=%s, "
-            "cache_namespace=%s, save_rank=%s",
+            "hash_namespace=%s, save_rank=%s",
             role.name,
             self.is_producer,
             self.is_consumer,
@@ -354,7 +366,7 @@ class UCMECConnector(ECConnectorBase):
             self.layout.dtype,
             self.layout.rows_per_chunk,
             self.layout.chunk_bytes,
-            self.cache_namespace.hex(),
+            self._block_hasher.seed.hex(),
             self.is_save_rank,
         )
 
@@ -399,7 +411,6 @@ class UCMECConnector(ECConnectorBase):
                         identifier=identifier,
                         num_embeds=num_embeds,
                         layout=self.layout,
-                        cache_namespace=self.cache_namespace,
                         hasher=self._block_hasher,
                     ),
                 )
@@ -625,7 +636,6 @@ class UCMECConnector(ECConnectorBase):
             identifier=mm_hash,
             num_embeds=num_embeds,
             layout=self.layout,
-            cache_namespace=self.cache_namespace,
             hasher=self._block_hasher,
         )
 
@@ -695,6 +705,6 @@ __all__ = [
     "UCMEncoderCacheError",
     "create_ucm_ec_store",
     "make_chunk_ids",
-    "resolve_cache_namespace",
+    "build_ec_hash_meta",
     "resolve_encoder_cache_layout",
 ]

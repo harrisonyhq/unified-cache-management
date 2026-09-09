@@ -2,6 +2,7 @@
 
 import copy
 import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -181,7 +182,7 @@ class ECConfigTest(unittest.TestCase):
             ec.UCMECConnector(self.vllm_config, ec.ECConnectorRole.SCHEDULER)
         create_store.assert_not_called()
 
-    def test_cache_namespace_preserves_identity_hash_input(self):
+    def test_ec_meta_preserves_model_identity(self):
         model = self.vllm_config.model_config
         model.revision = "weights-revision"
         model.code_revision = "code-revision"
@@ -190,21 +191,153 @@ class ECConfigTest(unittest.TestCase):
             _commit_hash="commit", architectures=["CustomArchitecture"],
         )
         model.multimodal_config = SimpleNamespace(compute_hash=lambda: "mm-hash")
-        hasher = Mock(return_value=b"namespace")
         self.assertEqual(
-            ec.resolve_cache_namespace(self.vllm_config, {}, hasher), b"namespace"
+            json.loads(ec.build_ec_hash_meta(self.vllm_config, {})),
+            [
+                "ucm:ec:v2",
+                [
+                    "org/model", "weights-revision", "code-revision",
+                    "tokenizer-revision", "commit", ["CustomArchitecture"], "mm-hash",
+                ],
+                [],
+            ],
         )
-        hasher.assert_called_once_with((
-            "org/model", "weights-revision", "code-revision",
-            "tokenizer-revision", "commit", ("CustomArchitecture",), "mm-hash",
-        ))
 
     def test_explicit_namespace_bypasses_model_identity(self):
-        hasher = Mock(return_value=b"namespace")
-        ec.resolve_cache_namespace(
-            SimpleNamespace(), {"cache_namespace": "shared"}, hasher
+        self.assertEqual(
+            json.loads(
+                ec.build_ec_hash_meta(
+                    SimpleNamespace(), {"cache_namespace": "shared"}
+                )
+            ),
+            ["ucm:ec:v2", "shared", []],
         )
-        hasher.assert_called_once_with("shared")
+
+    def hash_connector(self, config=None, encoder_config=None):
+        config = copy.deepcopy(self.vllm_config if config is None else config)
+        config.ec_transfer_config.is_ec_producer = True
+        config.ec_transfer_config.is_ec_consumer = True
+        ec_config = copy.deepcopy(self.config)
+        if encoder_config is not None:
+            ec_config["encoder_cache_config"].update(encoder_config)
+        with (
+            patch.object(Config, "load_ec_config", return_value=ec_config),
+            patch.object(ec, "create_ucm_ec_store", return_value=Mock()),
+        ):
+            return ec.UCMECConnector(config, ec.ECConnectorRole.SCHEDULER)
+
+    def chunk_keys(self, connector, identifier="image", num_embeds=7):
+        return ec.make_chunk_ids(
+            identifier=identifier,
+            num_embeds=num_embeds,
+            layout=connector.layout,
+            hasher=connector._block_hasher,
+        )
+
+    def test_chunk_keys_isolate_layout_even_with_explicit_namespace(self):
+        for namespace in ({}, {"cache_namespace": "shared"}):
+            base = self.hash_connector(encoder_config=namespace)
+            for change in ("width", "dtype", "rows"):
+                with self.subTest(namespace=namespace, change=change):
+                    config = copy.deepcopy(self.vllm_config)
+                    overrides = dict(namespace)
+                    if change == "width":
+                        overrides["encoder_cache_hidden_dim"] = 4096
+                    elif change == "dtype":
+                        # Same element size, different interpretation.
+                        config.model_config.dtype = torch.float16
+                    else:
+                        overrides["chunk_size"] = 4
+                    other = self.hash_connector(config, overrides)
+                    self.assertEqual(
+                        base._block_hasher.meta_bytes, other._block_hasher.meta_bytes
+                    )
+                    self.assertNotEqual(self.chunk_keys(base), self.chunk_keys(other))
+
+    def test_chunk_keys_ignore_kv_deployment_metadata(self):
+        base = self.chunk_keys(self.hash_connector())
+        for change in ("tp", "rank", "dp", "speculative", "sparse"):
+            with self.subTest(change=change):
+                config = copy.deepcopy(self.vllm_config)
+                if change == "tp":
+                    config.parallel_config.tensor_parallel_size = 2
+                elif change == "rank":
+                    config.parallel_config.rank = 1
+                elif change == "dp":
+                    config.parallel_config.data_parallel_rank = 1
+                elif change == "speculative":
+                    config.speculative_config = SimpleNamespace(
+                        method="mtp", num_speculative_tokens=3
+                    )
+                else:
+                    config.additional_config = {
+                        "enable_sparse_sfa_c8": True,
+                        "enable_sparse_li_c8": True,
+                    }
+                self.assertEqual(base, self.chunk_keys(self.hash_connector(config)))
+
+    def test_chunk_keys_isolate_deepstack_layers_including_equal_width(self):
+        for namespace in ({}, {"cache_namespace": "shared"}):
+            keys = []
+            widths = []
+            for indexes in ([], [8, 16], [7, 15], [16, 8]):
+                config = copy.deepcopy(self.vllm_config)
+                config.model_config.hf_config = SimpleNamespace(
+                    vision_config=SimpleNamespace(
+                        out_hidden_size=1024, deepstack_visual_indexes=indexes
+                    )
+                )
+                connector = self.hash_connector(config, namespace)
+                keys.append(self.chunk_keys(connector))
+                widths.append(connector.layout.width)
+            self.assertEqual(widths, [1024, 3072, 3072, 3072])
+            self.assertEqual(len(set(keys)), 4)
+
+    def test_chunk_keys_preserve_identity_rows_and_index_isolation(self):
+        connector = self.hash_connector()
+        keys = self.chunk_keys(connector)
+        self.assertEqual(keys, self.chunk_keys(self.hash_connector()))
+        self.assertEqual(len(set(keys)), 3)
+        self.assertNotEqual(keys, self.chunk_keys(connector, identifier="other"))
+        self.assertNotEqual(keys, self.chunk_keys(connector, num_embeds=8))
+        for field in ("model", "revision"):
+            config = copy.deepcopy(self.vllm_config)
+            setattr(config.model_config, field, "other")
+            self.assertNotEqual(keys, self.chunk_keys(self.hash_connector(config)))
+        self.assertNotEqual(
+            self.chunk_keys(
+                self.hash_connector(encoder_config={"cache_namespace": "a"})
+            ),
+            self.chunk_keys(
+                self.hash_connector(encoder_config={"cache_namespace": "b"})
+            ),
+        )
+
+    def test_scheduler_keys_match_saved_chunks_and_load_round_trip(self):
+        scheduler = self.hash_connector()
+        scheduler.ensure_cache_available(FakeRequest("request", ("image", 7)), 0)
+        state = scheduler.identifier_to_blocks["image"]
+        worker = self.hash_connector()
+        worker.is_save_rank = True
+        worker.device = torch.device("cpu")
+        tensor = torch.ones((7, worker.layout.width), dtype=worker.layout.dtype)
+        worker.save_caches({"image": tensor}, "image")
+        ids, _, chunks = worker.store.dump.call_args.args
+        self.assertEqual(ids, list(state.chunk_ids))
+
+        def load(block_ids, shard_indices, destinations):
+            self.assertEqual(block_ids, ids)
+            for (destination,), (source,) in zip(destinations, chunks):
+                destination.copy_(source)
+            return Mock()
+
+        worker.store.load.side_effect = load
+        worker._connector_metadata = ec.UCMECConnectorMetadata(
+            loads={"image": ec.ECLoadSpec(7, state.chunk_ids)}
+        )
+        cache = {}
+        worker.start_load_caches(cache)
+        torch.testing.assert_close(cache["image"], tensor)
 
     def test_store_overrides_do_not_mutate_yaml_and_split_backends(self):
         self.config["ucm_connector_config"].update(
@@ -415,8 +548,9 @@ class ECConnectorStateTest(unittest.TestCase):
         self.connector.pending_loads = {}
         self.connector._is_consumer = True
         self.connector._connector_metadata = None
-        self.connector.layout = SimpleNamespace(rows_per_chunk=3)
-        self.connector.cache_namespace = b"test"
+        self.connector.layout = ec.EncoderCacheLayout(
+            width=2, dtype=torch.float32, rows_per_chunk=3, chunk_bytes=24
+        )
         self.connector._block_hasher = Mock(
             side_effect=lambda value: hashlib.sha256(repr(value).encode()).digest()
         )

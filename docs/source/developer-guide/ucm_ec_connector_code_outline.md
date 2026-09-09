@@ -84,9 +84,11 @@ connector 相同的规则分割为路径列表。
 `store_unique_id` 使用 `.get()`，未配置时自动推导。显式 width 优先，实际 tensor 由 Worker 校验。
 仅在组装 Store 参数时浅拷贝一次 Store 配置，不深拷贝整个 YAML。
 
-`resolve_cache_namespace()` 直接组织模型、revision、HF commit、architecture 和 multimodal
-配置 hash，不再调用独立的模型 identity helper。显式 namespace 与自动 namespace 的
-hash 输入结构保持不变；模型名称仅用于缓存身份隔离，不参与宽度推导分支。
+`build_ec_hash_meta()` 直接组织模型、revision、HF commit、architecture 和 multimodal
+配置 hash，不再调用独立的模型 identity helper。自动或显式身份来源都与完整有序的
+`deepstack_visual_indexes` 及 EC 格式标记一起编码为 meta 字符串，再由 `RequestHasher`
+执行哈希，隔离同宽度但选取不同层的 EC。不再单独计算 namespace 摘要。
+模型名称仅用于缓存身份隔离，不参与宽度推导分支。
 
 Store 的 `share_buffer_enable` 强制为 `True`，`local_rank_size` 直接覆盖为 TP size，
 与 KV connector 的 MLA 分支一致。`use_gdr` 强制为 `False`；用户配置中出现该键时
@@ -231,24 +233,29 @@ def make_chunk_ids(
     identifier: str,
     num_embeds: int,
     layout: EncoderCacheLayout,
-    cache_namespace: bytes,
+    hasher: RequestHasher,
 ) -> tuple[bytes, ...]:
     num_chunks = ceil_div(num_embeds, layout.rows_per_chunk)
 
     return tuple(
-        ucm_hash_block_id(
-            cache_namespace,
-            layout.rows_per_chunk,
-            identifier,
-            num_embeds,
-            chunk_index,
+        hasher(
+            (
+                layout.width,
+                str(layout.dtype),
+                layout.rows_per_chunk,
+                identifier,
+                num_embeds,
+                chunk_index,
+            )
         )
         for chunk_index in range(num_chunks)
     )
 ```
 
-`ucm_hash_block_id()` 是对 UCM 当前 hash/block-id helper 的薄封装，负责转换成
-UCM Store 已接受的固定长度 block ID，不在 EC connector 内引入另一种 hash 格式。
+`RequestHasher(meta=build_ec_hash_meta(vllm_config, encoder_config))` 复用公共工具类，
+输出 Store 接受的 16 字节 ID。meta 用紧凑 JSON 编码 EC 格式标记、身份来源和 deepstack 层索引，
+不引入 KV 的 TP、rank、speculative 或 sparse meta。width 和 dtype 显式进入 key。
+旧持久化 EC key 将不再命中，不尝试旧格式回退；旧数据由现有机制回收。
 
 ## 5. Connector 类框架
 
@@ -266,16 +273,12 @@ class UCMECConnector(ECConnectorBase):
 
         ec_config = Config.load_ec_config(vllm_config.ec_transfer_config)
         encoder_config = ec_config["encoder_cache_config"]
-        self._block_hasher = RequestHasher(vllm_config, 0)
+        self._block_hasher = RequestHasher(
+            meta=build_ec_hash_meta(vllm_config, encoder_config)
+        )
         self.layout = resolve_encoder_cache_layout(
             vllm_config,
             encoder_config,
-            self._block_hasher,
-        )
-        self.cache_namespace = resolve_cache_namespace(
-            vllm_config,
-            encoder_config,
-            self._block_hasher,
         )
 
         # 复用现有 UCM connector 的 rank/device 初始化。Scheduler 不分配
@@ -382,7 +385,7 @@ def ensure_cache_available(
                     identifier=identifier,
                     num_embeds=num_embeds,
                     layout=self.layout,
-                    cache_namespace=self.cache_namespace,
+                    hasher=self._block_hasher,
                 ),
             )
 
@@ -676,7 +679,7 @@ def save_caches(
         identifier=mm_hash,
         num_embeds=num_embeds,
         layout=self.layout,
-        cache_namespace=self.cache_namespace,
+        hasher=self._block_hasher,
     )
 
     num_full_chunks, tail_rows = divmod(num_embeds, rows)
