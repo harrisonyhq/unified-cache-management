@@ -80,6 +80,26 @@ from ucm.sparse.state import has_ucm_sparse
 logger = init_logger(__name__)
 
 
+def build_kv_hash_meta(vllm_config: "VllmConfig", rank_id: int) -> str:
+    """Build the KV namespace while preserving existing persisted block keys."""
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    spec_info = ""
+    if speculative_config is not None:
+        spec_method = getattr(speculative_config, "method", "") or ""
+        spec_tokens = getattr(speculative_config, "num_speculative_tokens", 0)
+        spec_info = f":{spec_method}:{spec_tokens}"
+    additional_config = getattr(vllm_config, "additional_config", None) or {}
+    sparse_sfa_c8 = bool(additional_config.get("enable_sparse_sfa_c8", False))
+    sparse_li_c8 = bool(additional_config.get("enable_sparse_li_c8", False))
+    sparse_c8_info = f":sfa_c8={int(sparse_sfa_c8)}:li_c8={int(sparse_li_c8)}"
+    model_name = vllm_config.model_config.model.rstrip("/").split("/")[-1]
+    return (
+        f"{model_name}:"
+        f"{vllm_config.parallel_config.tensor_parallel_size}:"
+        f"{vllm_config.model_config.dtype}:{rank_id}{spec_info}{sparse_c8_info}"
+    )
+
+
 def _has_shared_indexer_layers(vllm_config: "VllmConfig") -> bool:
     model_config = getattr(vllm_config, "model_config", None)
     configs = (
@@ -1163,7 +1183,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
 
         defer_scheduler_store = getattr(self, "_defer_scheduler_store", False)
         if role == KVConnectorRole.SCHEDULER:
-            self.request_hasher = RequestHasher(vllm_config, 0)
+            self.request_hasher = RequestHasher(build_kv_hash_meta(vllm_config, 0))
             self._other_rank_hashers = self._make_other_rank_hashers(vllm_config)
             self._seed = self.request_hasher.seed
             # init scheduler-side connector
@@ -1171,8 +1191,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 self.store = self._create_store(None)
         else:
             self.request_hasher = RequestHasher(
-                vllm_config,
-                self.tp_rank % self.tp_size,
+                build_kv_hash_meta(vllm_config, self.tp_rank % self.tp_size)
             )
             self._connector_worker_meta = UCMWorkerMetadata(is_mla=self.is_mla)
 
@@ -1230,7 +1249,10 @@ class UCMDirectConnector(KVConnectorBase_V1):
         if self.is_mla:
             return []
         tp_size = vllm_config.parallel_config.tensor_parallel_size
-        return [RequestHasher(vllm_config, rank_id) for rank_id in range(1, tp_size)]
+        return [
+            RequestHasher(build_kv_hash_meta(vllm_config, rank_id))
+            for rank_id in range(1, tp_size)
+        ]
 
     def _record_load_error(self, metric_name: str, block_ids: Any) -> None:
         invalid_blocks = set(block_ids)
@@ -2436,13 +2458,15 @@ class UCMCPConnector(UCMLayerWiseConnector):
             vllm_config.parallel_config.tensor_parallel_size //= self.dcp_world_size
 
         if role == KVConnectorRole.SCHEDULER:
-            self.request_hasher = RequestHasher(vllm_config, 0)
+            self.request_hasher = RequestHasher(build_kv_hash_meta(vllm_config, 0))
             self._other_rank_hashers = self._make_other_rank_hashers(vllm_config)
             self._seed = self.request_hasher.seed
             # init scheduler-side connector
             self.store = self._create_store(None)
         else:
-            self.request_hasher = RequestHasher(vllm_config, self.tp_rank)
+            self.request_hasher = RequestHasher(
+                build_kv_hash_meta(vllm_config, self.tp_rank)
+            )
         vllm_config.parallel_config.tensor_parallel_size = old_tp_size
         self.block_size *= self.cp_world_size
         self._bind_request_block_hasher()
@@ -2584,7 +2608,7 @@ class UCMLiteConnector(KVConnectorBase_V1):
         self.requests_meta: dict[str, RequestMeta] = {}
         self.total_block_nums = 0
 
-        self.request_hasher = RequestHasher(vllm_config, 0)
+        self.request_hasher = RequestHasher(build_kv_hash_meta(vllm_config, 0))
         self._seed = self.request_hasher.seed
         self.request_block_hasher = self.request_hasher.make_request_block_hasher(
             self.hash_block_size, self._seed
