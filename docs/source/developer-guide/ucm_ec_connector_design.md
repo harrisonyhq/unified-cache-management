@@ -1010,7 +1010,7 @@ layout 各字段便于排查。
 
 ### 11.5 Shape 不一致
 
-Worker dump 时实际 tensor 的 `D` 或 dtype 与 connector layout 不一致：
+Worker dump 时实际 tensor 的 `D` 或 dtype 与 connector layout 不一致，目标策略为：
 
 - 不写任何 chunk；
 - 记录 error metric；
@@ -1018,11 +1018,14 @@ Worker dump 时实际 tensor 的 `D` 或 dtype 与 connector layout 不一致：
 - fail closed 或让请求继续使用本地 encoder 结果；
 - 不动态修改 Store layout。
 
+当前校验位于 `save_caches()` 的 `try` 外，异常会向调用方传播，并未实现保存校验失败后
+继续使用本地结果的降级。此问题记为 F3，纳入第 11.6 节统一规划，本次仅更新设计。
+
 Worker 直接以实际 tensor 的第一维作为 `N` 生成 key。若它与 Scheduler 从 request
 推导出的 `N` 不一致，后续 Scheduler 会使用另一个 `N` 生成 chunk ids，从而表现为
 miss，不会把错误形状的数据命中为合法 EC。
 
-### 11.6 后续专项：Load failure 与请求错误隔离（尚未实施）
+### 11.6 后续专项：Load/save failure 与请求错误隔离（尚未实施）
 
 本次只实施第 8 节的 streaming 增量登记和最终加载过滤。以下处理放到下一专项，
 现有请求校验异常、has_cache_item 查询证据和 Worker load/save 失败行为尚未改变。
@@ -1049,6 +1052,29 @@ miss，不会把错误形状的数据命中为合法 EC。
 - 已跳过 encoder compute 后，是否还保留重算输入、在哪个阶段可以安全回退。
 - 无法重算时如何返回请求错误，避免从 start_load_caches 抛出并拖垮引擎。
 - 异步在途 batch、abort、抢占和失败回传交错时，何时可以释放资源。
+
+**F3：Worker 保存失败边界。** 与 load failure 在同一专项中规划，但独立定义恢复策略。
+当前 `save_caches()` 中 `encoder_cache[mm_hash]`、`_validate_encoder_tensor()` 和
+`make_chunk_ids()` 均在 `try` 外；KeyError、布局校验错误和 key 构造错误可沿 runner
+调用链传播。当前 `except Exception` 只覆盖切块、dump 和 wait，不能描述为所有保存
+错误都已经降级为跳过。`store is None` 的生命周期错误也在该捕获范围外。
+
+后续方案需明确：
+
+- 对本地结果仍可正常用于推理的保存失败，拟采用记录错误并跳过该 item 写回的策略；
+  保留本地 encoder tensor，不因可选缓存写回失败触发重算或结束请求。
+- 在提交任何 chunk 前完成取值、布局校验和 key 构造；这些阶段失败时不提交 dump。
+  具体采用扩大 try 范围还是分类捕获，与错误分类和返回协议一并确定。
+- 本地 tensor 缺失不等同于普通存储失败，不能假定后续模型一定可继续；需核对调用方
+  不变量。Store 已关闭、全局配置无效和设备不可恢复错误也需单独分类，不能统一吞掉。
+- 已提交 dump 的失败不保证没有部分 chunk 落盘；其可见性、资源生命周期与重试边界
+  和 Store 一致性保证共同规划，不用“校验失败不写 chunk”替代这些保证。
+- 复用统一的阶段、原因分类和日志/指标；load 仍需阻止无效数据被消费，save 则优先
+  保留可用本地结果，不能直接套用 load 的失败重算流程。
+
+F3 验收覆盖缺失 key、非法 shape/width/dtype、key 构造异常、dump/wait 异常；验证
+前置失败不提交 dump、可降级失败不逃逸且本地 tensor 不变，并在 runner 路径验证健康
+请求可继续。正常保存与角色/rank 门控也需回归。F3 的运行时代码修改明确推迟到此专项。
 
 **查询证据边界。** 当前 step_verified_hits 仅添加，hit 后 miss 不撤销。专项需处理旧命中
 使计算路径产生 load 的风险，但撤销查询证据不能误删其他请求已经选择的 pending load。
@@ -1362,9 +1388,10 @@ chunk_bytes / hash_namespace (hasher seed) / pipeline / dp rank / save rank
 - 同 step 批量多个 identifier；
 - lookup/prefetch 联动。
 
-### Phase 3：Load failure、请求错误隔离与一致性增强
+### Phase 3：Load/save failure、请求错误隔离与一致性增强
 
-- 按第 11.6 节统一设计请求布局错误隔离与 load failure；此项尚未实施；
+- 按第 11.6 节统一设计请求布局错误隔离、load failure 和 F3 保存失败边界；尚未实施；
+- 明确保存前置校验异常的降级范围，区分可选写回失败与本地结果不可用；
 - 扩展 vLLM Scheduler/Model Runner 的 EC load-failure 协议；
 - 失败 item 不进入模型消费，释放失败 allocation；
 - 下一 step 强制作为 external miss 调度 encoder compute；

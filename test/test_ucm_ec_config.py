@@ -1,19 +1,30 @@
 """EC configuration, state and batched loads; CPU tensors and mocked Store I/O."""
 
 import copy
+import ctypes
 import hashlib
 import json
 import tempfile
 import unittest
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
+import numpy as np
 import torch
 import yaml
 
 from ucm.integration.vllm import ucm_ec_connector as ec
 from ucm.utils import Config
+
+
+def cpu_chunk(address, layout):
+    """View raw CPU memory without retaining the original Tensor owner."""
+    buffer = (ctypes.c_ubyte * layout.chunk_bytes).from_address(int(address))
+    return torch.frombuffer(buffer, dtype=layout.dtype).reshape(
+        layout.rows_per_chunk, layout.width
+    )
 
 
 class ECConfigTest(unittest.TestCase):
@@ -218,6 +229,8 @@ class ECConfigTest(unittest.TestCase):
         config.ec_transfer_config.is_ec_producer = True
         config.ec_transfer_config.is_ec_consumer = True
         ec_config = copy.deepcopy(self.config)
+        ec_config["ucm_connector_name"] = "UcmPipelineStore"
+        ec_config["ucm_connector_config"]["store_pipeline"] = "Cache|Posix"
         if encoder_config is not None:
             ec_config["encoder_cache_config"].update(encoder_config)
         with (
@@ -233,6 +246,47 @@ class ECConfigTest(unittest.TestCase):
             layout=connector.layout,
             hasher=connector._block_hasher,
         )
+
+    def test_producer_requires_queued_event_waits_before_opening_store(self):
+        for name, pipeline, supported in (
+            ("UcmPipelineStore", "Cache|Posix", True),
+            ("UcmPipelineStore", "Cache|Compress|Posix", True),
+            ("UcmPipelineStore", "Mooncake|Posix", True),
+            ("UcmPipelineStore", "YuanRong|Posix", True),
+            ("UcmPipelineStore", "Dram", False),
+            ("UcmPipelineStore", "Delegator", False),
+            ("UcmPipelineStore", "Posix", False),
+            ("UcmPipelineStore", "Fake", False),
+            ("UcmPipelineStore", "Custom", False),
+            ("UcmNfsStore", "", False),
+            ("CustomRegisteredStore", "Cache|Posix", False),
+        ):
+            for producer in (True, False):
+                with self.subTest(store=name, pipeline=pipeline, producer=producer):
+                    self.config["ucm_connector_name"] = name
+                    self.config["ucm_connector_config"]["store_pipeline"] = pipeline
+                    transfer = self.vllm_config.ec_transfer_config
+                    transfer.is_ec_producer = producer
+                    transfer.is_ec_consumer = True
+                    with (
+                        patch.object(
+                            Config, "load_ec_config", return_value=self.config
+                        ),
+                        patch.object(ec, "create_ucm_ec_store") as create_store,
+                    ):
+                        if producer and not supported:
+                            with self.assertRaisesRegex(
+                                ValueError, "prerequisite event"
+                            ):
+                                ec.UCMECConnector(
+                                    self.vllm_config, ec.ECConnectorRole.SCHEDULER
+                                )
+                            create_store.assert_not_called()
+                        else:
+                            ec.UCMECConnector(
+                                self.vllm_config, ec.ECConnectorRole.SCHEDULER
+                            )
+                            create_store.assert_called_once()
 
     def test_chunk_keys_isolate_layout_even_with_explicit_namespace(self):
         for namespace in ({}, {"cache_namespace": "shared"}):
@@ -320,18 +374,29 @@ class ECConfigTest(unittest.TestCase):
         worker = self.hash_connector()
         worker.is_save_rank = True
         worker.device = torch.device("cpu")
+        worker._save_device = Mock()
+        worker._save_device.get_event_handle.return_value = 11
+        stored = {}
+
+        def dump(block_ids, shard_indices, addresses, **kwargs):
+            for block_id, (address,) in zip(block_ids, addresses):
+                stored[block_id] = cpu_chunk(address, worker.layout).clone()
+            return Mock()
+
+        worker.store.dump_data.side_effect = dump
         tensor = torch.ones((7, worker.layout.width), dtype=worker.layout.dtype)
         worker.save_caches({"image": tensor}, "image")
-        ids, _, chunks = worker.store.dump.call_args.args
+        worker.get_finished(set())
+        ids, _, _ = worker.store.dump_data.call_args.args
         self.assertEqual(ids, list(state.chunk_ids))
 
         def load(block_ids, shard_indices, destinations):
             self.assertEqual(block_ids, ids)
-            for (destination,), (source,) in zip(destinations, chunks):
-                destination.copy_(source)
+            for block_id, (address,) in zip(block_ids, destinations):
+                cpu_chunk(address, worker.layout).copy_(stored[block_id])
             return Mock()
 
-        worker.store.load.side_effect = load
+        worker.store.load_data.side_effect = load
         worker._connector_metadata = ec.UCMECConnectorMetadata(
             loads={"image": ec.ECLoadSpec(7, state.chunk_ids)}
         )
@@ -451,13 +516,20 @@ class ECConnectorLoadTest(unittest.TestCase):
         self.wait_failures = set()
         self.failure = RuntimeError("injected Store failure")
         self.connector.store = Mock()
-        self.connector.store.load.side_effect = self.load
+        self.connector.store.load_data.side_effect = self.load
         self.connector.store.wait.side_effect = self.wait
 
     def load(self, chunk_ids, shard_indices, destinations):
         identifier = chr(chunk_ids[0][0])
         self.events.append(("load", identifier))
         self.assertEqual(shard_indices, [0] * len(chunk_ids))
+        self.assertEqual(destinations.dtype, np.dtype(np.uint64))
+        self.assertEqual(destinations.shape, (len(chunk_ids), 1))
+        self.assertTrue(destinations.flags.c_contiguous)
+        np.testing.assert_array_equal(
+            np.diff(destinations[:, 0]),
+            np.full(len(chunk_ids) - 1, self.connector.layout.chunk_bytes),
+        )
         if identifier == self.submit_failure:
             raise self.failure
         self.destinations[identifier] = destinations
@@ -469,8 +541,8 @@ class ECConnectorLoadTest(unittest.TestCase):
         self.assertNotIn(identifier, self.cache)
         if identifier in self.wait_failures:
             raise self.failure
-        for index, (tensor,) in enumerate(self.destinations[identifier]):
-            tensor.fill_(ord(identifier) + index)
+        for index, (address,) in enumerate(self.destinations[identifier]):
+            cpu_chunk(address, self.connector.layout).fill_(ord(identifier) + index)
 
     def test_submits_batch_before_waiting_and_publishes_unpadded_tensors(self):
         resident = torch.ones(1, 2)
@@ -539,6 +611,275 @@ class ECConnectorLoadTest(unittest.TestCase):
         torch.testing.assert_close(self.cache["C"], torch.full((2, 2), 67.0))
 
 
+class ECConnectorSaveTest(unittest.TestCase):
+    def setUp(self):
+        self.connector = ec.UCMECConnector.__new__(ec.UCMECConnector)
+        self.connector.layout = ec.EncoderCacheLayout(
+            width=2, dtype=torch.float32, rows_per_chunk=3, chunk_bytes=24
+        )
+        self.connector._is_producer = True
+        self.connector.is_save_rank = True
+        self.connector._pending_saves = []
+        self.connector._save_device = Mock()
+        self.connector._save_device.get_event_handle.side_effect = [11, 12, 13]
+        self.connector._block_hasher = ec.RequestHasher(meta="test")
+        self.connector.pending_loads = {}
+        self.connector.step_verified_hits = set()
+        self.connector.req_to_state = {}
+        self.connector.identifier_to_blocks = {}
+        self.connector._connector_metadata = ec.UCMECConnectorMetadata()
+        self.connector.store = Mock(spec=ec.UcmKVStoreBaseV1)
+        self.calls = []
+        self.transfers = []
+        self.completed = []
+        self.wait_failures = set()
+        self.connector.store.dump_data.side_effect = self.dump
+        self.connector.store.wait.side_effect = self.wait
+
+    def dump(self, ids, shards, addresses, prerequisite_handle=0):
+        self.assertEqual(addresses.dtype, np.dtype(np.uint64))
+        self.assertEqual(addresses.shape, (len(ids), 1))
+        self.assertTrue(addresses.flags.c_contiguous)
+        self.assertEqual(shards, [0] * len(ids))
+        task = len(self.transfers)
+        self.calls.append(("dump", task))
+        self.transfers.append((addresses.copy(), prerequisite_handle))
+        return task
+
+    def wait(self, task):
+        self.calls.append(("wait", task))
+        addresses, event = self.transfers[task]
+        # Event and raw-pointer owners must survive through completion.
+        self.assertNotIn(
+            ((event,), {}),
+            self.connector._save_device.destroy_event_handle.call_args_list,
+        )
+        if task in self.wait_failures:
+            raise RuntimeError("injected wait failure")
+        self.completed.append(
+            torch.cat(
+                [
+                    cpu_chunk(address, self.connector.layout).clone()
+                    for (address,) in addresses
+                ]
+            )
+        )
+
+    def test_submits_all_items_before_waiting_and_preserves_padding(self):
+        inputs = [
+            torch.arange(n * 2, dtype=torch.float32).reshape(n, 2) for n in (7, 6, 2)
+        ]
+        for index, tensor in enumerate(inputs):
+            self.connector.save_caches({str(index): tensor}, str(index))
+        self.assertEqual(self.calls, [("dump", i) for i in range(3)])
+        self.connector._save_device.destroy_event_handle.assert_not_called()
+        # Full chunks point directly into each input; only a tail is allocated.
+        for tensor, (addresses, _) in zip(inputs, self.transfers):
+            for index in range(tensor.shape[0] // 3):
+                self.assertEqual(
+                    int(addresses[index, 0]), tensor.data_ptr() + index * 24
+                )
+        self.assertEqual(self.connector.get_finished(set()), (None, None))
+        self.assertEqual(
+            self.calls,
+            [("dump", i) for i in range(3)] + [("wait", i) for i in range(3)],
+        )
+        for tensor, saved in zip(inputs, self.completed):
+            torch.testing.assert_close(saved[: len(tensor)], tensor)
+            self.assertEqual(torch.count_nonzero(saved[len(tensor) :]).item(), 0)
+        self.assertFalse(self.connector._pending_saves)
+        self.assertEqual(self.connector._save_device.destroy_event_handle.call_count, 3)
+        self.connector.get_finished(set())
+        self.assertEqual(self.connector.store.wait.call_count, 3)
+
+    def test_owners_survive_cache_eviction_and_are_released_after_wait(self):
+        tensor = torch.ones(4, 2)
+        reference = weakref.ref(tensor)
+        cache = {"image": tensor}
+        self.connector.save_caches(cache, "image")
+        tail_reference = weakref.ref(self.connector._pending_saves[0].tail)
+        cache.clear()
+        del tensor
+        self.assertIsNotNone(reference())
+        self.assertIsNotNone(tail_reference())
+        self.connector.get_finished(set())
+        self.assertIsNone(reference())
+        self.assertIsNone(tail_reference())
+        torch.testing.assert_close(self.completed[0][:4], torch.ones(4, 2))
+
+    def test_wait_failure_does_not_skip_later_tasks_or_event_cleanup(self):
+        for identifier in ("A", "B"):
+            self.connector.save_caches({identifier: torch.ones(3, 2)}, identifier)
+        self.wait_failures.add(0)
+        self.connector.get_finished(set())
+        self.assertEqual(
+            self.calls, [("dump", 0), ("dump", 1), ("wait", 0), ("wait", 1)]
+        )
+        self.assertEqual(self.connector._save_device.destroy_event_handle.call_count, 2)
+        self.assertFalse(self.connector._pending_saves)
+
+    def test_submission_failure_releases_its_event_and_keeps_earlier_task(self):
+        self.connector.save_caches({"A": torch.ones(3, 2)}, "A")
+        self.connector.store.dump_data.side_effect = RuntimeError("submission failed")
+        self.connector.save_caches({"B": torch.ones(4, 2)}, "B")
+        self.connector._save_device.destroy_event_handle.assert_called_once_with(12)
+        self.connector.get_finished(set())
+        self.assertEqual(self.calls, [("dump", 0), ("wait", 0)])
+
+    def test_clear_metadata_preserves_pending_saves_and_their_owners(self):
+        tensor = torch.ones(4, 2)
+        cache = {"A": tensor}
+        self.connector.save_caches(cache, "A")
+        tensor_reference = weakref.ref(tensor)
+        tail_reference = weakref.ref(self.connector._pending_saves[0].tail)
+        cache.clear()
+        del tensor
+
+        self.connector.clear_connector_metadata()
+
+        self.assertIsNone(self.connector._connector_metadata)
+        self.assertEqual(self.calls, [("dump", 0)])
+        self.assertEqual(len(self.connector._pending_saves), 1)
+        self.assertIsNotNone(tensor_reference())
+        self.assertIsNotNone(tail_reference())
+        self.connector._save_device.destroy_event_handle.assert_not_called()
+        self.connector.get_finished(set())
+        self.assertEqual(self.calls, [("dump", 0), ("wait", 0)])
+        self.assertIsNone(tensor_reference())
+        self.assertIsNone(tail_reference())
+
+    def test_shutdown_drains_before_clearing_state_and_closing_store(self):
+        for wait_fails in (False, True):
+            with self.subTest(wait_fails=wait_fails):
+                self.setUp()
+                self.connector.save_caches({"A": torch.ones(4, 2)}, "A")
+                store = self.connector.store
+                self.connector.pending_loads["A"] = Mock()
+                if wait_fails:
+                    self.wait_failures.add(0)
+
+                def wait(task):
+                    self.assertIn("A", self.connector.pending_loads)
+                    self.assertIsNotNone(self.connector._connector_metadata)
+                    self.wait(task)
+
+                store.wait.side_effect = wait
+                # close is optional on the Store interface.
+                store.close = Mock(side_effect=lambda: self.calls.append(("close", 0)))
+                self.connector.shutdown()
+                self.assertEqual(
+                    self.calls, [("dump", 0), ("wait", 0), ("close", 0)]
+                )
+                self.assertIsNone(self.connector._connector_metadata)
+                self.assertFalse(self.connector.pending_loads)
+                self.assertFalse(self.connector._pending_saves)
+                self.assertIsNone(self.connector.store)
+                self.connector._save_device.destroy_event_handle.assert_called_once_with(
+                    11
+                )
+                self.connector.shutdown()
+                store.wait.assert_called_once_with(0)
+                store.close.assert_called_once()
+
+    def test_event_is_recorded_after_padding_before_submission(self):
+        def record():
+            self.assertFalse(self.transfers)
+            # Captured tail has already been filled on the compute stream.
+            torch.testing.assert_close(tails[0][:1], torch.ones(1, 2))
+            self.assertEqual(torch.count_nonzero(tails[0][1:]).item(), 0)
+            return 11
+
+        tails = []
+        zeros = torch.zeros
+
+        def allocate(*args, **kwargs):
+            tail = zeros(*args, **kwargs)
+            tails.append(tail)
+            return tail
+
+        self.connector._save_device.get_event_handle.side_effect = record
+        with patch.object(ec.torch, "zeros", side_effect=allocate):
+            self.connector.save_caches({"A": torch.ones(4, 2)}, "A")
+        self.assertEqual(self.transfers[0][1], 11)
+        self.connector._save_device.synchronize.assert_not_called()
+        self.connector.get_finished(set())
+
+    def test_save_records_event_without_waiting_with_or_without_tail(self):
+        for num_rows in (3, 4):
+            with self.subTest(num_rows=num_rows):
+                self.setUp()
+                device = self.connector._save_device
+
+                def record():
+                    self.calls.append(("record", 11))
+                    return 11
+
+                device.get_event_handle.side_effect = record
+                tensor = torch.ones(num_rows, 2)
+                # Device owns platform operations; EC must not create or wait
+                # on its own CUDA/NPU events or streams.
+                with (
+                    patch.object(ec.torch, "cuda") as cuda,
+                    patch.object(ec.torch, "npu", create=True) as npu,
+                ):
+                    self.connector.save_caches({"A": tensor}, "A")
+                self.assertEqual(self.calls, [("record", 11), ("dump", 0)])
+                self.assertEqual(device.mock_calls, [call.get_event_handle()])
+                self.assertEqual(cuda.mock_calls, [])
+                self.assertEqual(npu.mock_calls, [])
+                self.assertEqual(self.transfers[0][1], 11)
+                self.connector.store.wait.assert_not_called()
+                self.connector.get_finished(set())
+                device.destroy_event_handle.assert_called_once_with(11)
+
+    def test_failed_event_skips_dump_and_preserves_prior_work(self):
+        for failure in (0, RuntimeError("injected event failure")):
+            with self.subTest(failure=failure):
+                self.setUp()
+                self.connector._save_device.get_event_handle.side_effect = [11, failure]
+                self.connector.save_caches({"A": torch.ones(3, 2)}, "A")
+                with patch.object(ec.logger, "exception") as log_error:
+                    self.connector.save_caches({"B": torch.ones(4, 2)}, "B")
+                log_error.assert_called_once()
+                self.assertEqual(self.calls, [("dump", 0)])
+                self.assertEqual(len(self.connector._pending_saves), 1)
+                self.connector._save_device.synchronize.assert_not_called()
+                self.connector._save_device.destroy_event_handle.assert_not_called()
+                self.connector.get_finished(set())
+                self.assertEqual(self.calls, [("dump", 0), ("wait", 0)])
+                self.connector._save_device.destroy_event_handle.assert_called_once_with(
+                    11
+                )
+
+    def test_producer_and_rank_gates_prevent_submission(self):
+        for producer, rank in ((False, True), (True, False)):
+            self.connector._is_producer = producer
+            self.connector.is_save_rank = rank
+            self.connector.save_caches({}, "absent")
+        self.assertFalse(self.calls)
+        self.connector._save_device.get_event_handle.assert_not_called()
+
+    def test_invalid_layout_never_submits_and_prior_work_can_be_drained(self):
+        self.connector.save_caches({"A": torch.ones(3, 2)}, "A")
+        with self.assertRaises(ec.EncoderCacheLayoutError):
+            self.connector.save_caches({"B": torch.ones(3, 4)}, "B")
+        self.connector.get_finished(set())
+        self.connector.clear_connector_metadata()
+        self.assertEqual(self.calls, [("dump", 0), ("wait", 0)])
+
+    def test_address_arithmetic_handles_unsigned_high_bit_and_storage_offset(self):
+        addresses = self.connector._chunk_addresses(
+            Mock(data_ptr=lambda: 2**63 + 128), 3
+        )
+        self.assertEqual(
+            addresses[:, 0].tolist(), [2**63 + 128 + i * 24 for i in range(3)]
+        )
+        tensor = torch.arange(16, dtype=torch.float32).reshape(8, 2)[2:]
+        self.connector.save_caches({"A": tensor}, "A")
+        self.connector.get_finished(set())
+        torch.testing.assert_close(self.completed[0], tensor)
+
+
 class ECConnectorStateTest(unittest.TestCase):
     def setUp(self):
         self.connector = ec.UCMECConnector.__new__(ec.UCMECConnector)
@@ -546,6 +887,7 @@ class ECConnectorStateTest(unittest.TestCase):
         self.connector.identifier_to_blocks = {}
         self.connector.step_verified_hits = set()
         self.connector.pending_loads = {}
+        self.connector._pending_saves = []
         self.connector._is_consumer = True
         self.connector._connector_metadata = None
         self.connector.layout = ec.EncoderCacheLayout(

@@ -1,6 +1,6 @@
 """UCM-backed vLLM encoder-cache connector.
 
-The connector submits batch loads before waiting synchronously for completion.
+The connector submits loads before waiting and drains saves at the end of a step.
 An encoder-cache item is a variable-length ``[N, D]`` tensor, while UCM stores
 fixed-size blocks, so each item is represented by one or more fixed-row chunks.
 Scheduler state carries
@@ -14,6 +14,7 @@ import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -32,6 +33,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import ECConnectorOutput
 
 from ucm.integration.vllm.device import (
+    create_device,
     get_current_device_id,
     get_ucm_worker_torch_device,
 )
@@ -92,6 +94,15 @@ class IdentifierState:
 class ECLoadSpec:
     num_embeds: int
     chunk_ids: tuple[bytes, ...]
+
+
+@dataclass(slots=True)
+class PendingECSave:
+    identifier: str
+    task: Task
+    tensor: torch.Tensor
+    tail: torch.Tensor | None
+    event_handle: int
 
 
 @dataclass
@@ -292,7 +303,7 @@ def create_ucm_ec_store(
 
 
 class UCMECConnector(ECConnectorBase):
-    """Synchronous, fixed-chunk UCM encoder-cache connector."""
+    """Fixed-chunk EC transfers completed within each model execution step."""
 
     def __init__(
         self,
@@ -311,6 +322,20 @@ class UCMECConnector(ECConnectorBase):
             raise EncoderCacheLayoutError("UCM EC does not support multimodal pruning.")
 
         ec_config = Config.load_ec_config(vllm_config.ec_transfer_config)
+        # These device-facing stages enqueue prerequisite waits on their copy
+        # stream or transfer worker. Dram and Delegator wait inside Dump;
+        # other stages may ignore the event entirely. Reject before opening
+        # the Store rather than introducing a blocking save fallback.
+        pipeline = ec_config["ucm_connector_config"].get("store_pipeline", "")
+        if self.is_producer and (
+            ec_config["ucm_connector_name"] != "UcmPipelineStore"
+            or pipeline.split("|")[0] not in {"Cache", "Mooncake", "YuanRong"}
+        ):
+            raise ValueError(
+                "UCM EC asynchronous saves require UcmPipelineStore with a "
+                "Cache, Mooncake, or YuanRong first stage that queues "
+                "prerequisite event waits."
+            )
         encoder_config = ec_config["encoder_cache_config"]
         self._block_hasher = RequestHasher(
             meta=build_ec_hash_meta(vllm_config, encoder_config)
@@ -346,6 +371,8 @@ class UCMECConnector(ECConnectorBase):
         self.identifier_to_blocks: dict[str, IdentifierState] = {}
         self.step_verified_hits: set[str] = set()
         self.pending_loads: dict[str, ECLoadSpec] = {}
+        self._pending_saves: list[PendingECSave] = []
+        self._save_device = create_device() if role == ECConnectorRole.WORKER else None
 
         self.is_save_rank = False
         if role == ECConnectorRole.WORKER:
@@ -553,12 +580,12 @@ class UCMECConnector(ECConnectorBase):
                     dtype=self.layout.dtype,
                     device=self.device,
                 )
-                dst_chunks = [[storage[index]] for index in range(expected_chunks)]
+                dst_addrs = self._chunk_addresses(storage, expected_chunks)
                 try:
-                    task = self.store.load(
+                    task = self.store.load_data(
                         list(spec.chunk_ids),
                         [0] * expected_chunks,
-                        dst_chunks,
+                        dst_addrs,
                     )
                 except Exception as exc:
                     raise UCMEncoderCacheError(
@@ -585,6 +612,14 @@ class UCMECConnector(ECConnectorBase):
             raise UCMEncoderCacheError(
                 identifier, "Failed to load encoder cache item"
             ) from cause
+
+    def _chunk_addresses(self, tensor: torch.Tensor, num_chunks: int) -> np.ndarray:
+        # EC tensors are contiguous; no per-chunk Tensor views are needed.
+        # Use logical chunk bytes, not the Store's aligned physical shard size.
+        offsets = np.arange(num_chunks, dtype=np.uint64)
+        offsets *= np.uint64(self.layout.chunk_bytes)
+        offsets += np.uint64(tensor.data_ptr())
+        return offsets.reshape(-1, 1)
 
     def _validate_encoder_tensor(
         self,
@@ -640,11 +675,9 @@ class UCMECConnector(ECConnectorBase):
         )
 
         num_full_chunks, tail_rows = divmod(num_embeds, rows)
+        event_handle = 0
         try:
-            src_chunks = [
-                [tensor[index * rows : (index + 1) * rows]]
-                for index in range(num_full_chunks)
-            ]
+            src_addrs = self._chunk_addresses(tensor, len(chunk_ids))
             tail: torch.Tensor | None = None
             if tail_rows:
                 tail = torch.zeros(
@@ -653,16 +686,42 @@ class UCMECConnector(ECConnectorBase):
                     device=tensor.device,
                 )
                 tail[:tail_rows].copy_(tensor[num_full_chunks * rows :])
-                src_chunks.append([tail])
+                src_addrs[-1, 0] = np.uint64(tail.data_ptr())
 
-            task = self.store.dump(
+            # Record after both encoder compute and tail padding. The Store's
+            # copy stream must wait for these writes before reading raw pointers.
+            event_handle = self._save_device.get_event_handle()
+            if event_handle == 0:
+                raise RuntimeError("Failed to record EC save prerequisite event.")
+            task = self.store.dump_data(
                 list(chunk_ids),
                 [0] * len(chunk_ids),
-                src_chunks,
+                src_addrs,
+                prerequisite_handle=event_handle,
             )
-            self.store.wait(task)
+            self._pending_saves.append(
+                PendingECSave(mm_hash, task, tensor, tail, event_handle)
+            )
         except Exception:
+            if event_handle:
+                self._save_device.destroy_event_handle(event_handle)
             logger.exception("Failed to dump EC item %s", mm_hash)
+
+    def _wait_pending_saves(self) -> None:
+        if not self._pending_saves:
+            return
+        if self.store is None:
+            raise RuntimeError("UCM EC store is closed with pending saves.")
+        pending, self._pending_saves = self._pending_saves, []
+        for save in pending:
+            try:
+                self.store.wait(save.task)
+            except Exception:
+                # Saving is best effort; one failure must not skip later waits.
+                logger.exception("Failed to dump EC item %s", save.identifier)
+            finally:
+                if save.event_handle:
+                    self._save_device.destroy_event_handle(save.event_handle)
 
     def register_caches(
         self,
@@ -675,12 +734,14 @@ class UCMECConnector(ECConnectorBase):
         finished_req_ids: set[str],
     ) -> tuple[set[str] | None, set[str] | None]:
         del finished_req_ids
+        self._wait_pending_saves()
         return None, None
 
     def build_connector_worker_meta(self) -> ECConnectorWorkerMetadata | None:
         return None
 
     def shutdown(self) -> None:
+        self._wait_pending_saves()
         self.pending_loads.clear()
         self.step_verified_hits.clear()
         self.req_to_state.clear()
