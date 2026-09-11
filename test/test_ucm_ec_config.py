@@ -610,6 +610,50 @@ class ECConnectorLoadTest(unittest.TestCase):
         self.assertEqual(set(self.cache), {"C"})
         torch.testing.assert_close(self.cache["C"], torch.full((2, 2), 67.0))
 
+    def test_load_debug_logs_item_and_step_summaries(self):
+        self.cache["B"] = torch.ones(1, 2)
+        with self.assertLogs(ec.logger, level="DEBUG") as captured:
+            self.connector.start_load_caches(self.cache)
+
+        messages = [record.getMessage() for record in captured.records]
+        self.assertTrue(
+            any(
+                "EC load item A: shape=[4, 2], chunks=2, bytes=48" in message
+                for message in messages
+            )
+        )
+        self.assertTrue(
+            any(
+                "EC load item C: shape=[2, 2], chunks=1, bytes=24" in message
+                for message in messages
+            )
+        )
+        self.assertTrue(
+            any(
+                "EC loads: submitted=2, loaded=2, failed=0, skipped=1, "
+                "chunks=3, bytes=72" in message
+                for message in messages
+            )
+        )
+
+    def test_load_wait_failure_is_counted_in_step_summary(self):
+        self.cache["B"] = torch.ones(1, 2)
+        self.wait_failures.add("A")
+        with (
+            self.assertLogs(ec.logger, level="DEBUG") as captured,
+            self.assertRaises(ec.UCMEncoderCacheError),
+        ):
+            self.connector.start_load_caches(self.cache)
+
+        messages = [record.getMessage() for record in captured.records]
+        self.assertTrue(
+            any(
+                "EC loads: submitted=2, loaded=1, failed=1, skipped=1, "
+                "chunks=1, bytes=24" in message
+                for message in messages
+            )
+        )
+
 
 class ECConnectorSaveTest(unittest.TestCase):
     def setUp(self):
@@ -832,6 +876,23 @@ class ECConnectorSaveTest(unittest.TestCase):
                 self.connector.get_finished(set())
                 device.destroy_event_handle.assert_called_once_with(11)
 
+    def test_dump_debug_logs_shape_and_padded_size(self):
+        with self.assertLogs(ec.logger, level="DEBUG") as captured:
+            self.connector.save_caches({"A": torch.ones(7, 2)}, "A")
+        message = captured.records[0].getMessage()
+        self.assertIn(
+            "EC dump item A: shape=[7, 2], chunks=3, tail_rows=1, bytes=72",
+            message,
+        )
+        self.assertIn("submit_ms=", message)
+
+        with self.assertLogs(ec.logger, level="DEBUG") as captured:
+            self.connector.save_caches({"B": torch.ones(6, 2)}, "B")
+        self.assertIn(
+            "EC dump item B: shape=[6, 2], chunks=2, tail_rows=0, bytes=48",
+            captured.records[0].getMessage(),
+        )
+
     def test_failed_event_skips_dump_and_preserves_prior_work(self):
         for failure in (0, RuntimeError("injected event failure")):
             with self.subTest(failure=failure):
@@ -1042,6 +1103,42 @@ class ECConnectorStateTest(unittest.TestCase):
         self.ensure(request)
         self.select_load(request)
         self.assertFalse(self.metadata().loads)
+
+    def test_hit_summary_logged_once_at_request_finish(self):
+        request = FakeRequest("request", ("X", 4), ("Y", 5))
+        self.ensure(request)
+        self.select_load(request, 0)
+        self.select_load(request, 1)
+        # Steps never log; hits accumulate silently until the request ends.
+        with self.assertNoLogs(ec.logger, level="INFO"):
+            metadata = self.metadata(request=1)
+        self.assertEqual(set(metadata.loads), {"X", "Y"})
+
+        with self.assertLogs(ec.logger, level="INFO") as captured:
+            self.connector.request_finished(request)
+        self.assertEqual(len(captured.records), 1)
+        message = captured.records[0].getMessage()
+        self.assertIn("req=request", message)
+        self.assertIn("mm_items=2", message)
+        self.assertIn("hits_total=2", message)
+
+        # Finishing again is a no-op and logs nothing.
+        with self.assertNoLogs(ec.logger, level="INFO"):
+            self.connector.request_finished(request)
+
+    def test_all_miss_request_gets_zero_hit_summary_at_finish(self):
+        request = FakeRequest("request", ("X", 4))
+        self.ensure(request)
+        # No alloc callback ever verifies a hit, so steps stay silent...
+        with self.assertNoLogs(ec.logger, level="INFO"):
+            self.metadata(request=1)
+        # ...and the request's single summary line reports the zero.
+        with self.assertLogs(ec.logger, level="INFO") as captured:
+            self.connector.request_finished(request)
+        message = captured.records[0].getMessage()
+        self.assertIn("req=request", message)
+        self.assertIn("mm_items=1", message)
+        self.assertIn("hits_total=0", message)
 
     def test_shutdown_clears_streaming_and_step_state(self):
         request = FakeRequest("request", ("X", 4))

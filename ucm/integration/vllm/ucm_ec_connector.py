@@ -11,6 +11,7 @@ the tensor from padded chunk storage or dump a newly computed tensor.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -81,6 +82,8 @@ class EncoderCacheLayout:
 class RequestState:
     processed_feature_count: int = 0
     identifier_states: dict[str, IdentifierState] = field(default_factory=dict)
+    # Items whose external hits were verified for this request.
+    hit_identifiers: set[str] = field(default_factory=set)
 
 
 @dataclass(slots=True)
@@ -485,6 +488,13 @@ class UCMECConnector(ECConnectorBase):
         identifier = request.mm_features[index].identifier
         if not self.is_consumer or identifier not in self.step_verified_hits:
             return
+        # Accumulate the hit here (O(1) per hit) for the request-finished
+        # summary instead of scanning every scheduled request. This must
+        # precede the pending-load dedup: a shared identifier counts for every
+        # request that references it, not just the one that queued the load.
+        request_state = self.req_to_state.get(request.request_id)
+        if request_state is not None:
+            request_state.hit_identifiers.add(identifier)
         if identifier in self.pending_loads:
             return
         state = self.identifier_to_blocks.get(identifier)
@@ -527,6 +537,17 @@ class UCMECConnector(ECConnectorBase):
         if request_state is None:
             return False, None
 
+        # The connector's single per-request hit summary; hits were
+        # accumulated in update_state_after_alloc, so all-miss requests
+        # report a zero here too.
+        if self.is_consumer:
+            logger.info(
+                "EC request cache hits: req=%s, mm_items=%d, hits_total=%d",
+                request.request_id,
+                len(request_state.identifier_states),
+                len(request_state.hit_identifiers),
+            )
+
         for identifier in request_state.identifier_states:
             state = self.identifier_to_blocks.get(identifier)
             if state is None:
@@ -563,9 +584,12 @@ class UCMECConnector(ECConnectorBase):
         width = self.layout.width
         pending: list[tuple[str, ECLoadSpec, torch.Tensor, Task]] = []
         wait_error: tuple[str, Exception] | None = None
+        skipped_items = 0
+        submit_start = time.perf_counter()
         try:
             for identifier, spec in metadata.loads.items():
                 if identifier in encoder_cache:
+                    skipped_items += 1
                     continue
                 expected_chunks = (spec.num_embeds + rows - 1) // rows
                 if spec.num_embeds <= 0 or len(spec.chunk_ids) != expected_chunks:
@@ -593,19 +617,54 @@ class UCMECConnector(ECConnectorBase):
                     ) from exc
                 pending.append((identifier, spec, storage, task))
         finally:
+            submit_ms = (time.perf_counter() - submit_start) * 1e3
             # Retain destinations and drain every submitted task even if a later
             # allocation/submission or an earlier wait fails.
+            wait_start = time.perf_counter()
+            loaded_items = failed_items = 0
+            total_chunks = 0
+            total_bytes = 0
             for identifier, spec, storage, task in pending:
+                item_start = time.perf_counter()
                 try:
                     self.store.wait(task)
                     encoder_cache[identifier] = storage.view(-1, width)[
                         : spec.num_embeds
                     ]
+                    loaded_items += 1
+                    item_chunks = len(spec.chunk_ids)
+                    item_bytes = item_chunks * self.layout.chunk_bytes
+                    total_chunks += item_chunks
+                    total_bytes += item_bytes
+                    logger.debug(
+                        "EC load item %s: shape=[%d, %d], chunks=%d, bytes=%d, "
+                        "wait_ms=%.2f",
+                        identifier,
+                        spec.num_embeds,
+                        width,
+                        item_chunks,
+                        item_bytes,
+                        (time.perf_counter() - item_start) * 1e3,
+                    )
                 except Exception as exc:
                     encoder_cache.pop(identifier, None)
+                    failed_items += 1
                     logger.exception("Failed to load EC item %s", identifier)
                     if wait_error is None:
                         wait_error = (identifier, exc)
+            if pending:
+                logger.debug(
+                    "EC loads: submitted=%d, loaded=%d, failed=%d, skipped=%d, "
+                    "chunks=%d, bytes=%d, submit_ms=%.2f, wait_ms=%.2f",
+                    len(pending),
+                    loaded_items,
+                    failed_items,
+                    skipped_items,
+                    total_chunks,
+                    total_bytes,
+                    submit_ms,
+                    (time.perf_counter() - wait_start) * 1e3,
+                )
 
         if wait_error is not None:
             identifier, cause = wait_error
@@ -663,6 +722,7 @@ class UCMECConnector(ECConnectorBase):
             raise RuntimeError("UCM EC store is closed.")
 
         tensor = encoder_cache[mm_hash]
+        save_start = time.perf_counter()
         self._validate_encoder_tensor(mm_hash, tensor)
         num_embeds = int(tensor.shape[0])
         rows = self.layout.rows_per_chunk
@@ -701,6 +761,17 @@ class UCMECConnector(ECConnectorBase):
             )
             self._pending_saves.append(
                 PendingECSave(mm_hash, task, tensor, tail, event_handle)
+            )
+            logger.debug(
+                "EC dump item %s: shape=[%d, %d], chunks=%d, tail_rows=%d, "
+                "bytes=%d, submit_ms=%.2f",
+                mm_hash,
+                num_embeds,
+                width,
+                len(chunk_ids),
+                tail_rows,
+                len(chunk_ids) * self.layout.chunk_bytes,
+                (time.perf_counter() - save_start) * 1e3,
             )
         except Exception:
             if event_handle:
