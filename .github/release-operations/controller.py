@@ -813,8 +813,10 @@ class Controller:
         if number not in active:
             raise OperationError("验证对象属于当前版本的需求或源归档 Bug")
         item = self.issue(number)
+        repository = self.api.rest("")
+        tested_commit = self.api.rest("commits/" + repository["default_branch"])["sha"]
         result = "Passed" if passed else "Failed"
-        body = f"<!-- ucm-verification:v1 -->\n验证对象：#{number}\n目标 Milestone：{milestone_number(item)}\n结果：{result}\n证据：{evidence}\n验证者：@{actor}"
+        body = f"<!-- ucm-verification:v1 -->\n验证对象：#{number}\n目标 Milestone：{milestone_number(item)}\n测试代码：{tested_commit}\n结果：{result}\n证据：{evidence}\n验证者：@{actor}"
         self.api.rest(f"issues/{number}/comments", "POST", {"body": body})
         status = (
             "status:verified"
@@ -839,6 +841,7 @@ class Controller:
             "evidence": evidence,
             "actor": actor,
             "milestone": milestone_number(item),
+            "tested_commit": tested_commit,
             "merged_prs": [
                 key
                 for key, record in state["prs"].items()
@@ -884,19 +887,20 @@ class Controller:
             if "pull_request" not in i
         ]
         pending = []
+        repo = self.api.rest("")
+        head = self.api.rest("commits/" + repo["default_branch"])["sha"]
         for item in {i["number"]: i for i in items}.values():
             record = state.get("verification", {}).get(str(item["number"]), {})
             if (
                 item["state"] != "closed"
                 or record.get("result") != "Passed"
                 or record.get("milestone") != target
+                or record.get("tested_commit") != head
             ):
                 pending.append(item["number"])
         if pending:
             return state, {"status": "blocked", "pending": pending}
         pending_prs = []
-        repo = self.api.rest("")
-        head = self.api.rest("commits/" + repo["default_branch"])["sha"]
         for number, record in state["prs"].items():
             if record.get("last") != target:
                 continue
