@@ -214,7 +214,8 @@ class GitHub:
         return parsed
 
     def rest(self, path: str, method="GET", data=None):
-        return self.call("repos/" + self.repository + "/" + path, method, data)
+        endpoint = "repos/" + self.repository
+        return self.call(endpoint + ("/" + path if path else ""), method, data)
 
     def pages(self, path: str) -> list:
         items = []
@@ -314,6 +315,12 @@ class Controller:
             body += f"| Bug #{number} | {record.get('target_title') or '待定'} | {record['mode']} |\n"
         for number, record in state.get("prs", {}).items():
             body += f"| PR #{number} | {record.get('target_title') or '待定'} | {record['mode']} |\n"
+        if state.get("readiness"):
+            body += (
+                "\n\n### 最近发布准入\n\n```json\n"
+                + json.dumps(state["readiness"], ensure_ascii=False)
+                + "\n```\n"
+            )
         body += "\n\n### 最近范围操作\n\n" + "\n".join(state.get("history", [])[-8:])
         body += f"\n\n<!-- ucm-release-state:v1 {serialized} -->"
         if len(body) > 60000:
@@ -565,6 +572,7 @@ class Controller:
                 self.api.rest(f"issues/{release}", "PATCH", {"body": patched})
             # Keep the actual created title as a display value while key/number identify scope.
             state["scope"] = desired
+            state["readiness"] = {"status": "stale", "reason": "范围已更新"}
             state["initialized"] = True
             state["revision"] += 1
             state["history"].append(
@@ -805,8 +813,10 @@ class Controller:
         if number not in active:
             raise OperationError("验证对象属于当前版本的需求或源归档 Bug")
         item = self.issue(number)
+        repository = self.api.rest("")
+        tested_commit = self.api.rest("commits/" + repository["default_branch"])["sha"]
         result = "Passed" if passed else "Failed"
-        body = f"<!-- ucm-verification:v1 -->\n验证对象：#{number}\n目标 Milestone：{milestone_number(item)}\n结果：{result}\n证据：{evidence}\n验证者：@{actor}"
+        body = f"<!-- ucm-verification:v1 -->\n验证对象：#{number}\n目标 Milestone：{milestone_number(item)}\n测试代码：{tested_commit}\n结果：{result}\n证据：{evidence}\n验证者：@{actor}"
         self.api.rest(f"issues/{number}/comments", "POST", {"body": body})
         status = (
             "status:verified"
@@ -831,12 +841,14 @@ class Controller:
             "evidence": evidence,
             "actor": actor,
             "milestone": milestone_number(item),
+            "tested_commit": tested_commit,
             "merged_prs": [
                 key
                 for key, record in state["prs"].items()
                 if number in record.get("bugs", []) and record.get("merged")
             ],
         }
+        state["readiness"] = {"status": "stale", "reason": "验证记录已更新"}
         self.save(release, state, f"已记录 #{number} 的验证：{result}")
         if "bug" in labels:
             self.project_item(
@@ -875,19 +887,20 @@ class Controller:
             if "pull_request" not in i
         ]
         pending = []
+        repo = self.api.rest("")
+        head = self.api.rest("commits/" + repo["default_branch"])["sha"]
         for item in {i["number"]: i for i in items}.values():
             record = state.get("verification", {}).get(str(item["number"]), {})
             if (
                 item["state"] != "closed"
                 or record.get("result") != "Passed"
                 or record.get("milestone") != target
+                or record.get("tested_commit") != head
             ):
                 pending.append(item["number"])
         if pending:
             return state, {"status": "blocked", "pending": pending}
         pending_prs = []
-        repo = self.api.rest("")
-        head = self.api.rest("commits/" + repo["default_branch"])["sha"]
         for number, record in state["prs"].items():
             if record.get("last") != target:
                 continue
@@ -905,6 +918,7 @@ class Controller:
     def publish(self, release: int):
         self.reconcile(release)
         state, result = self.readiness(release)
+        state["readiness"] = result
         if result["status"] != "ready":
             self.save(
                 release, state, "发布准入：" + json.dumps(result, ensure_ascii=False)
@@ -1044,26 +1058,34 @@ class Controller:
                 "command_cursor", 0
             ) or comment_id in before.get("processed_comments", []):
                 return
-            if match := re.fullmatch(r"/(release_init|update)( --dry-run)?", command):
-                self.initialize_or_update(release, match[1], bool(match[2]))
-            elif match := re.fullmatch(
-                r"/verify #(\d+) (passed|failed) (https://\S+)", command
-            ):
-                self.verify(
-                    release, int(match[1]), match[2] == "passed", match[3], actor
-                )
-            elif command == "/release_ready":
-                self.reconcile(release)
-                state, result = self.readiness(release)
-                self.save(
-                    release,
-                    state,
-                    "发布准入：" + json.dumps(result, ensure_ascii=False),
-                )
-            elif command == "/release_publish":
-                self.publish(release)
-            else:
-                raise OperationError("命令格式错误")
+            try:
+                if match := re.fullmatch(
+                    r"/(release_init|update)( --dry-run)?", command
+                ):
+                    self.initialize_or_update(release, match[1], bool(match[2]))
+                elif match := re.fullmatch(
+                    r"/verify #(\d+) (passed|failed) (https://\S+)", command
+                ):
+                    self.verify(
+                        release, int(match[1]), match[2] == "passed", match[3], actor
+                    )
+                elif command == "/release_ready":
+                    self.reconcile(release)
+                    state, result = self.readiness(release)
+                    state["readiness"] = result
+                    self.save(
+                        release,
+                        state,
+                        "发布准入：" + json.dumps(result, ensure_ascii=False),
+                    )
+                elif command == "/release_publish":
+                    self.publish(release)
+                else:
+                    raise OperationError("命令格式错误")
+            except Exception as error:
+                _, failed = self.load(release)
+                self.save(release, failed, f"执行失败：`{command}`\n\n{error}")
+                raise
             _, latest = self.load(release)
             latest.setdefault("processed_comments", []).append(comment_id)
             latest["processed_comments"] = latest["processed_comments"][-500:]

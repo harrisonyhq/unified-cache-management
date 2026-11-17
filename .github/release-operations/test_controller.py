@@ -3,6 +3,7 @@ import unittest
 
 from controller import (
     Controller,
+    GitHub,
     OperationError,
     bug_progress,
     issue_reference,
@@ -31,6 +32,12 @@ PLAN = """## 版本信息
 
 
 class ParserContracts(unittest.TestCase):
+    def test_repository_root_endpoint_has_no_trailing_slash(self):
+        api = GitHub(REPOSITORY)
+        api.call = lambda path, method, data: path
+        self.assertEqual(api.rest(""), "repos/" + REPOSITORY)
+        self.assertEqual(api.rest("issues/12"), "repos/" + REPOSITORY + "/issues/12")
+
     def test_parent_and_children_are_unambiguous(self):
         parsed = parse_release(PLAN, REPOSITORY)
         self.assertEqual(parsed["version"], "0.11.0")
@@ -156,6 +163,16 @@ class MemoryGitHub:
             return copy.deepcopy(
                 [i for i in self.items.values() if {"name": "bug"} in i["labels"]]
             )
+        if path.startswith("issues?state=all&milestone="):
+            target = int(path.split("milestone=")[1].split("&")[0])
+            return copy.deepcopy(
+                [
+                    i
+                    for i in self.items.values()
+                    if (i.get("milestone") or {}).get("number") == target
+                    and {"name": "bug"} in i["labels"]
+                ]
+            )
         if path.endswith("/sub_issues"):
             number = int(path.split("/")[1])
             return copy.deepcopy(
@@ -172,6 +189,10 @@ class MemoryGitHub:
         raise AssertionError(path)
 
     def rest(self, path, method="GET", data=None):
+        if path == "":
+            return {"default_branch": "main"}
+        if path == "commits/main":
+            return {"sha": "a" * 40}
         parts = path.split("/")
         if path == "milestones" and method == "POST":
             item = dict(
@@ -349,6 +370,44 @@ class RepositoryOperations(unittest.TestCase):
         comment, state = self.controller.load(1)
         self.assertIn("待归档", comment["body"])
         self.assertTrue(state["initialized"])
+
+    def test_readiness_error_is_written_back_to_the_result_comment(self):
+        self.controller.authorize = lambda actor: None
+
+        def fail(release):
+            raise OperationError("receipt lookup failed")
+
+        self.controller.readiness = fail
+        user = {"login": "maintainer", "type": "User"}
+        command = {"id": 20, "issue": 1, "user": user, "body": "/release_ready"}
+        with self.assertRaises(OperationError):
+            self.controller.handle(
+                {"issue": {"number": 1}, "comment": command, "sender": user},
+                "issue_comment",
+            )
+        comment, _ = self.controller.load(1)
+        self.assertIn("执行失败", comment["body"])
+        self.assertIn("receipt lookup failed", comment["body"])
+
+    def test_changed_code_requires_current_candidate_verification(self):
+        self.controller.initialize_or_update(1, "release_init")
+        _, state = self.controller.load(1)
+        for entry in state["scope"].values():
+            self.api.items[entry["number"]]["state"] = "closed"
+        state["verification"] = {
+            str(e["number"]): {
+                "result": "Passed",
+                "milestone": state["milestone"]["number"],
+                "tested_commit": "old",
+            }
+            for e in state["scope"].values()
+        }
+        self.controller.save(1, state, "Previous candidate accepted")
+        self.assertEqual(self.controller.readiness(1)[1]["status"], "blocked")
+        for record in state["verification"].values():
+            record["tested_commit"] = "a" * 40
+        self.controller.save(1, state, "Current candidate accepted")
+        self.assertEqual(self.controller.readiness(1)[1]["status"], "ready")
 
 
 if __name__ == "__main__":

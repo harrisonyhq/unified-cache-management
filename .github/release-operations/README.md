@@ -59,6 +59,11 @@ The publication adapter produces a GitHub Release and a Tag. Package, container,
 and external distribution adapters can call the same readiness interface and
 attach their own verified delivery receipts.
 
+Verification records include the tested default-branch commit. Readiness checks
+that accepted requirements and target Bugs were verified against the current
+candidate, and that linked target-version fix PRs are merged into that candidate.
+After a code change, submit verification for the new candidate before publishing.
+
 Run the contract tests with:
 
 ```shell
