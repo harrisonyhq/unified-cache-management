@@ -438,6 +438,15 @@ class Controller:
             if dry_run:
                 self.save(release, state, f"预览 `{command}`\n\n```json\n{plan}\n```")
                 return
+            if (
+                command == "update"
+                and state.get("initialized")
+                and not any(diff.values())
+            ):
+                self.reconcile(release)
+                _, state = self.load(release)
+                self.save(release, state, "范围一致，已完成状态对账。")
+                return
             if command == "release_init" and state.get("initialized"):
                 self.save(
                     release,
@@ -674,6 +683,7 @@ class Controller:
             )
             record = self.milestone_history(pr["number"], record)
             record["bugs"] = refs
+            record["merged"] = bool(pr.get("merged_at"))
             if len(targets) > 1:
                 problems.append(
                     f"PR #{number} 关联 Bug 的目标版本冲突，请指定 PR Milestone"
@@ -798,6 +808,21 @@ class Controller:
                 pending.append(item["number"])
         if pending:
             return state, {"status": "blocked", "pending": pending}
+        pending_prs = []
+        repo = self.api.rest("")
+        head = self.api.rest("commits/" + repo["default_branch"])["sha"]
+        for number, record in state["prs"].items():
+            if record.get("last") != target:
+                continue
+            pr = self.api.rest("pulls/" + number)
+            if not pr.get("merged_at"):
+                pending_prs.append(int(number))
+                continue
+            comparison = self.api.rest(f"compare/{pr['merge_commit_sha']}...{head}")
+            if comparison["status"] not in ("ahead", "identical"):
+                pending_prs.append(int(number))
+        if pending_prs:
+            return state, {"status": "blocked", "pending_prs": pending_prs}
         return state, {"status": "ready", "pending": []}
 
     def publish(self, release: int):
