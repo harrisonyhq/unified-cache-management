@@ -3,6 +3,7 @@ import unittest
 
 from controller import (
     Controller,
+    GitHub,
     OperationError,
     bug_progress,
     issue_reference,
@@ -31,6 +32,12 @@ PLAN = """## 版本信息
 
 
 class ParserContracts(unittest.TestCase):
+    def test_repository_root_endpoint_has_no_trailing_slash(self):
+        api = GitHub(REPOSITORY)
+        api.call = lambda path, method, data: path
+        self.assertEqual(api.rest(""), "repos/" + REPOSITORY)
+        self.assertEqual(api.rest("issues/12"), "repos/" + REPOSITORY + "/issues/12")
+
     def test_parent_and_children_are_unambiguous(self):
         parsed = parse_release(PLAN, REPOSITORY)
         self.assertEqual(parsed["version"], "0.11.0")
@@ -349,6 +356,24 @@ class RepositoryOperations(unittest.TestCase):
         comment, state = self.controller.load(1)
         self.assertIn("待归档", comment["body"])
         self.assertTrue(state["initialized"])
+
+    def test_readiness_error_is_written_back_to_the_result_comment(self):
+        self.controller.authorize = lambda actor: None
+
+        def fail(release):
+            raise OperationError("receipt lookup failed")
+
+        self.controller.readiness = fail
+        user = {"login": "maintainer", "type": "User"}
+        command = {"id": 20, "issue": 1, "user": user, "body": "/release_ready"}
+        with self.assertRaises(OperationError):
+            self.controller.handle(
+                {"issue": {"number": 1}, "comment": command, "sender": user},
+                "issue_comment",
+            )
+        comment, _ = self.controller.load(1)
+        self.assertIn("执行失败", comment["body"])
+        self.assertIn("receipt lookup failed", comment["body"])
 
 
 if __name__ == "__main__":
