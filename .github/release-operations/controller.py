@@ -612,7 +612,14 @@ class Controller:
             if "pull_request" in bug:
                 continue
             source = field(bug.get("body") or "", "源版本主 Bug Issue")
-            if source and issue_reference(source, self.repository) == state["archive"]:
+            try:
+                archive_number = (
+                    issue_reference(source, self.repository) if source else None
+                )
+            except OperationError:
+                problems.append(f"Bug #{bug['number']} 的源版本待归档")
+                continue
+            if archive_number == state["archive"]:
                 self.attach(bug, state["archive"])
         bugs = self.api.pages(f"issues/{state['archive']}/sub_issues")
         for bug in bugs:
@@ -770,12 +777,17 @@ class Controller:
             "milestone": milestone_number(item),
         }
         self.save(release, state, f"已记录 #{number} 的验证：{result}")
-        project_name = (
-            "Bugfix"
-            if "bug" in labels
-            else "Connector v2" if "Connector" in item["title"] else "模型适配"
-        )
-        self.project_item(item, project_name, actor, result)
+        if "bug" in labels:
+            self.project_item(item, "Bugfix", actor, result)
+        else:
+            membership = self.api.graphql(
+                """query($id:ID!){node(id:$id){... on Issue{projectItems(first:100){nodes{project{id}}}}}}""",
+                id=item["node_id"],
+            )["node"]["projectItems"]["nodes"]
+            existing_projects = {member["project"]["id"] for member in membership}
+            for name, project in self.config["projects"].items():
+                if project["id"] in existing_projects:
+                    self.project_item(item, name, actor, result)
 
     def readiness(self, release: int):
         _, state = self.load(release)
@@ -896,7 +908,52 @@ class Controller:
         if permission not in ("admin", "maintain", "write"):
             raise OperationError("此操作需要仓库 write、maintain 或 admin 权限")
 
-    def handle(self, event: dict, event_name: str):
+    def drain_commands(self, release: int, ceiling: int | None = None):
+        for comment in sorted(
+            self.api.pages(f"issues/{release}/comments"), key=lambda item: item["id"]
+        ):
+            if ceiling is not None and comment["id"] >= ceiling:
+                break
+            if comment["user"]["type"] != "User":
+                continue
+            if (
+                not comment["body"]
+                .strip()
+                .startswith(
+                    (
+                        "/release_init",
+                        "/update",
+                        "/verify",
+                        "/release_ready",
+                        "/release_publish",
+                    )
+                )
+            ):
+                continue
+            _, state = self.load(release)
+            if comment["id"] <= state.get("command_cursor", 0) or str(
+                comment["id"]
+            ) in state.get("processed_comments", []):
+                continue
+            try:
+                self.handle(
+                    {
+                        "issue": {"number": release},
+                        "comment": comment,
+                        "sender": comment["user"],
+                    },
+                    "issue_comment",
+                    replay=True,
+                )
+            except OperationError as error:
+                print(f"Command #{comment['id']} requires attention: {error}")
+                _, state = self.load(release)
+                state["command_cursor"] = max(
+                    state.get("command_cursor", 0), comment["id"]
+                )
+                self.save(release, state, f"命令 #{comment['id']} 待人工处理：{error}")
+
+    def handle(self, event: dict, event_name: str, replay=False):
         if event_name == "issue_comment":
             if event.get("issue", {}).get("pull_request"):
                 return
@@ -914,9 +971,13 @@ class Controller:
             actor = event["sender"]["login"]
             self.authorize(actor)
             release = event["issue"]["number"]
+            if not replay:
+                self.drain_commands(release, ceiling=event["comment"]["id"])
             _, before = self.load(release)
             comment_id = str(event["comment"]["id"])
-            if comment_id in before.get("processed_comments", []):
+            if int(comment_id) <= before.get(
+                "command_cursor", 0
+            ) or comment_id in before.get("processed_comments", []):
                 return
             if match := re.fullmatch(r"/(release_init|update)( --dry-run)?", command):
                 self.initialize_or_update(release, match[1], bool(match[2]))
@@ -941,6 +1002,9 @@ class Controller:
             _, latest = self.load(release)
             latest.setdefault("processed_comments", []).append(comment_id)
             latest["processed_comments"] = latest["processed_comments"][-500:]
+            latest["command_cursor"] = max(
+                latest.get("command_cursor", 0), int(comment_id)
+            )
             current_comment, _ = self.load(release)
             # Preserve the actual result while checkpointing processed command IDs.
             result = (
@@ -951,37 +1015,7 @@ class Controller:
             self.save(release, latest, result)
         else:
             for release in self.releases():
-                if event_name in ("schedule", "workflow_dispatch"):
-                    _, state = self.load(release)
-                    for comment in self.api.pages(f"issues/{release}/comments"):
-                        body = comment["body"].strip()
-                        if (
-                            comment["user"]["type"] == "User"
-                            and str(comment["id"])
-                            not in state.get("processed_comments", [])
-                            and body.startswith(
-                                (
-                                    "/release_init",
-                                    "/update",
-                                    "/verify",
-                                    "/release_ready",
-                                    "/release_publish",
-                                )
-                            )
-                        ):
-                            try:
-                                self.handle(
-                                    {
-                                        "issue": {"number": release},
-                                        "comment": comment,
-                                        "sender": comment["user"],
-                                    },
-                                    "issue_comment",
-                                )
-                            except OperationError as error:
-                                print(
-                                    f"Command #{comment['id']} requires attention: {error}"
-                                )
+                self.drain_commands(release)
                 self.reconcile(release, event)
 
 

@@ -50,8 +50,9 @@ All mutations go through `GitHub.rest`/`graphql`.
 The Bot owns one result comment with an embedded machine state: stable object
 IDs, source keys, scope snapshots, Milestone ownership, verification evidence and
 processed command IDs. Formal execution replaces previews. Workflow concurrency
-serializes writers; periodic reconciliation recovers commands that were superseded
-in the Actions pending queue. Creation-origin markers recover objects when a
+serializes writers; each metadata event and later command replays earlier pending
+comments in order, with periodic reconciliation as a fallback. A persistent
+command cursor keeps completed history from being replayed. Creation-origin markers recover objects when a
 request succeeded before its checkpoint was saved.
 
 The publication adapter produces a GitHub Release and a Tag. Package, container,

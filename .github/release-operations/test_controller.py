@@ -151,6 +151,21 @@ class MemoryGitHub:
         if path.endswith("/comments"):
             number = int(path.split("/")[1])
             return copy.deepcopy([c for c in self.comments if c["issue"] == number])
+        if path == "issues?state=all&labels=bug":
+            return copy.deepcopy(
+                [i for i in self.items.values() if {"name": "bug"} in i["labels"]]
+            )
+        if path.endswith("/sub_issues"):
+            number = int(path.split("/")[1])
+            return copy.deepcopy(
+                [
+                    self.items[n]
+                    for n, parent in self.parents.items()
+                    if parent == number
+                ]
+            )
+        if path == "pulls?state=all":
+            return []
         if path.startswith("issues?"):
             return copy.deepcopy(list(self.items.values()))
         raise AssertionError(path)
@@ -278,6 +293,37 @@ class RepositoryOperations(unittest.TestCase):
         )
         self.controller.initialize_or_update(1, "update")
         self.assertEqual(self.api.items[child]["milestone"]["number"], 2)
+
+    def test_later_command_recovers_cancelled_earlier_command_in_order(self):
+        self.controller.authorize = lambda actor: None
+        user = {"login": "maintainer", "type": "User"}
+        preview = {
+            "id": 10,
+            "issue": 1,
+            "user": user,
+            "body": "/release_init --dry-run",
+        }
+        apply = {"id": 11, "issue": 1, "user": user, "body": "/release_init"}
+        self.api.comments.extend([preview, apply])
+        self.controller.handle(
+            {"issue": {"number": 1}, "comment": apply, "sender": user}, "issue_comment"
+        )
+        _, state = self.controller.load(1)
+        self.assertTrue(state["initialized"])
+        self.assertEqual(state["processed_comments"], ["10", "11"])
+        self.assertEqual(state["command_cursor"], 11)
+        self.controller.drain_commands(1)
+        self.assertEqual(len(self.api.items), 4)
+
+    def test_unassigned_bug_template_does_not_block_version_reconciliation(self):
+        self.controller.initialize_or_update(1, "release_init")
+        self.api.items[99] = self.api.make_issue(
+            99, "Unassigned Bug", "源版本主 Bug Issue：#", ["bug"]
+        )
+        Controller.reconcile(self.controller, 1)
+        comment, state = self.controller.load(1)
+        self.assertIn("待归档", comment["body"])
+        self.assertTrue(state["initialized"])
 
 
 if __name__ == "__main__":
