@@ -6,7 +6,7 @@ on:
   issues:
     types: [opened, edited, labeled, milestoned, demilestoned, closed, reopened]
   pull_request_target:
-    types: [opened, edited, reopened, synchronize, milestoned, demilestoned, closed]
+    types: [opened, edited, reopened, synchronize, closed]
   schedule:
     - cron: '*/15 * * * *'
   workflow_dispatch:
