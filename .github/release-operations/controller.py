@@ -168,6 +168,21 @@ def manual_mode(record: dict, current: int | None, human_event: bool = False) ->
     return updated
 
 
+def bug_progress(
+    closed: bool, verification: dict, merged: set[str], has_pr: bool
+) -> tuple[str, str]:
+    if closed and verification.get("result") == "Passed":
+        return "status:verified", "Done"
+    reviewed_fixes = set(verification.get("merged_prs", []))
+    if verification.get("result") in ("Failed", "Passed") and merged == reviewed_fixes:
+        return "status:fixing", "In progress"
+    if merged:
+        return "status:verification", "In review"
+    if has_pr:
+        return "status:fixing", "In progress"
+    return "status:triage", "Ready"
+
+
 class GitHub:
     def __init__(self, repository: str):
         self.repository = repository
@@ -294,11 +309,11 @@ class Controller:
             + "\n".join(rows)
         )
         body = body.replace("@None", "待指定")
-        body += "\n\n### 缺陷与修复 PR\n\n| 对象 | Milestone 编号 | 管理方式 |\n| --- | --- | --- |\n"
+        body += "\n\n### 缺陷与修复 PR\n\n| 对象 | 目标版本 | 管理方式 |\n| --- | --- | --- |\n"
         for number, record in state.get("bugs", {}).items():
-            body += f"| Bug #{number} | {record.get('last')} | {record['mode']} |\n"
+            body += f"| Bug #{number} | {record.get('target_title') or '待定'} | {record['mode']} |\n"
         for number, record in state.get("prs", {}).items():
-            body += f"| PR #{number} | {record.get('last')} | {record['mode']} |\n"
+            body += f"| PR #{number} | {record.get('target_title') or '待定'} | {record['mode']} |\n"
         body += "\n\n### 最近范围操作\n\n" + "\n".join(state.get("history", [])[-8:])
         body += f"\n\n<!-- ucm-release-state:v1 {serialized} -->"
         if len(body) > 60000:
@@ -568,7 +583,12 @@ class Controller:
             raise
 
     def project_item(
-        self, issue: dict, project_name: str, verifier=None, validation=None
+        self,
+        issue: dict,
+        project_name: str,
+        verifier=None,
+        validation=None,
+        status=None,
     ):
         project = self.config["projects"][project_name]
         item = self.api.graphql(
@@ -579,6 +599,7 @@ class Controller:
         for name, value in (
             ("Validation owner", verifier),
             ("Validation status", validation),
+            ("Status", status),
         ):
             if not value:
                 continue
@@ -647,13 +668,13 @@ class Controller:
                 record["last"] = target
                 bug["milestone"] = state["milestone"]
             state["bugs"][number] = record
+            record["target_title"] = (bug.get("milestone") or {}).get("title")
             state.setdefault("observed", {})[number] = {
                 "state": bug["state"],
                 "milestone": record["last"],
             }
             if "bug" not in {label["name"] for label in bug["labels"]}:
                 self.api.rest(f"issues/{number}/labels", "POST", {"labels": ["bug"]})
-            self.project_item(bug, "Bugfix")
         self.save(release, state, "同步中：Bug 默认版本与人工指定已记录")
         bug_numbers = {bug["number"] for bug in bugs}
         prs = self.api.pages("pulls?state=all")
@@ -703,7 +724,42 @@ class Controller:
             elif targets and current not in targets:
                 problems.append(f"PR #{number} 使用人工目标，与关联 Bug 的目标版本不同")
             state["prs"][number] = record
+            if record["mode"] == "auto" and len(targets) <= 1:
+                record["target_title"] = (
+                    (linked[0].get("milestone") or {}).get("title") if linked else None
+                )
+            else:
+                record["target_title"] = (pr.get("milestone") or {}).get("title")
             self.project_item(pr, "Bugfix")
+        for bug in bugs:
+            number = str(bug["number"])
+            related = {
+                key: value
+                for key, value in state["prs"].items()
+                if bug["number"] in value.get("bugs", [])
+            }
+            merged = {key for key, value in related.items() if value.get("merged")}
+            verification = state.get("verification", {}).get(number, {})
+            status_label, project_status = bug_progress(
+                bug["state"] == "closed", verification, merged, bool(related)
+            )
+            current_labels = [label["name"] for label in bug["labels"]]
+            if status_label not in current_labels:
+                labels = [
+                    label for label in current_labels if not label.startswith("status:")
+                ]
+                self.api.rest(
+                    f"issues/{number}",
+                    "PATCH",
+                    {
+                        "labels": (
+                            labels + ["bug", status_label]
+                            if "bug" not in labels
+                            else labels + [status_label]
+                        )
+                    },
+                )
+            self.project_item(bug, "Bugfix", status=project_status)
         for entry in state["scope"].values():
             issue = self.issue(entry["number"])
             state.setdefault("observed", {})[str(issue["number"])] = {
@@ -775,10 +831,17 @@ class Controller:
             "evidence": evidence,
             "actor": actor,
             "milestone": milestone_number(item),
+            "merged_prs": [
+                key
+                for key, record in state["prs"].items()
+                if number in record.get("bugs", []) and record.get("merged")
+            ],
         }
         self.save(release, state, f"已记录 #{number} 的验证：{result}")
         if "bug" in labels:
-            self.project_item(item, "Bugfix", actor, result)
+            self.project_item(
+                item, "Bugfix", actor, result, "Done" if passed else "In progress"
+            )
         else:
             membership = self.api.graphql(
                 """query($id:ID!){node(id:$id){... on Issue{projectItems(first:100){nodes{project{id}}}}}}""",
@@ -787,7 +850,9 @@ class Controller:
             existing_projects = {member["project"]["id"] for member in membership}
             for name, project in self.config["projects"].items():
                 if project["id"] in existing_projects:
-                    self.project_item(item, name, actor, result)
+                    self.project_item(
+                        item, name, actor, result, "Done" if passed else "In progress"
+                    )
 
     def readiness(self, release: int):
         _, state = self.load(release)

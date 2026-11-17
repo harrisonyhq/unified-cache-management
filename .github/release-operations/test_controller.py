@@ -4,6 +4,7 @@ import unittest
 from controller import (
     Controller,
     OperationError,
+    bug_progress,
     issue_reference,
     manual_mode,
     parse_release,
@@ -253,6 +254,30 @@ class RepositoryOperations(unittest.TestCase):
         )
         self.assertEqual(self.api.parents[state["archive"]], 1)
         self.assertEqual(len(self.api.items), 4)
+
+    def test_bug_enters_verification_after_fix_merge(self):
+        self.assertEqual(
+            bug_progress(False, {}, {"9"}, True), ("status:verification", "In review")
+        )
+
+    def test_failed_verification_waits_for_a_new_fix(self):
+        record = {"result": "Failed", "merged_prs": ["9"]}
+        self.assertEqual(
+            bug_progress(False, record, {"9"}, True), ("status:fixing", "In progress")
+        )
+        self.assertEqual(
+            bug_progress(False, record, {"9", "12"}, True),
+            ("status:verification", "In review"),
+        )
+
+    def test_verified_bug_is_done_and_reopened_bug_returns_to_fixing(self):
+        record = {"result": "Passed", "merged_prs": ["9"]}
+        self.assertEqual(
+            bug_progress(True, record, {"9"}, True), ("status:verified", "Done")
+        )
+        self.assertEqual(
+            bug_progress(False, record, {"9"}, True), ("status:fixing", "In progress")
+        )
 
     def test_retry_recovers_issue_created_before_lost_response(self):
         self.api.lose_response_for = "Connector v2 接口契约"
