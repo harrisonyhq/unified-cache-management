@@ -1,0 +1,21 @@
+name: Version test bug
+description: Report a bug found while testing a version; add it under the version's Bug Archive.
+title: '[Bug] '
+labels: [bug, 'status:triage']
+body:
+  - type: textarea
+    id: report
+    attributes:
+      label: 缺陷记录
+      value: |
+        源版本主 Bug Issue：#
+        关联需求：#
+        测试代码或镜像：
+        引擎及版本、模型、硬件和配置：
+        复现步骤与命令：
+        预期结果：
+        实际结果：
+        复现频率：
+        日志、case 或报告链接：
+    validations:
+      required: true

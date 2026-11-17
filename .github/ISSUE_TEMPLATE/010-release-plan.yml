@@ -1,0 +1,39 @@
+name: Version plan
+description: Create a release plan and initialize its requirements with /release_init.
+title: '[Release] UCM '
+labels: [release]
+body:
+  - type: textarea
+    id: plan
+    attributes:
+      label: 版本计划
+      description: 保留稳定条目标识。执行 /release_init 初始化，编辑正文后执行 /update 同步。
+      value: |
+        ## 版本信息
+
+        版本号：0.11.0
+        版本目标：
+        Release Manager：
+        Test Lead：
+
+        ## 需求列表
+
+        ### 需求 connector-v2
+
+        需求：Connector v2 首批上库
+        开发负责人：待指定
+        验证负责人：待指定
+        验收要求：
+
+        #### 子需求 connector-contract
+
+        需求：Connector v2 接口契约
+        开发负责人：待指定
+        验证负责人：待指定
+        验收要求：
+
+        ## 变更记录
+
+        变更说明：初始范围
+    validations:
+      required: true
