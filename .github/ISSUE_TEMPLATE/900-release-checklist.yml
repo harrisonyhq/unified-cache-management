@@ -1,100 +1,124 @@
 name: Release Checklist
-description: Generate a release checklist issue when prepare a new release.(Used for release team)
-title: "[Release]: Release checklist for v"
-
+description: Plan and manage a release through structured requirements and a checklist.
+title: '[Release] UCM v'
+labels: [release]
 body:
-- type: textarea
-  attributes:
-    description: >
-      Brief info for the new release.
-    label: Release Checklist
-    value: >
-      **Release Version**: 
+  - type: textarea
+    id: release_information
+    attributes:
+      label: Release Information
+      description: Complete the release information below.
+      value: |
+        version: 0.12.0
+        branch: main
+        goal: Complete the planned integrations and interface updates.
+        release_manager:
+        test_lead:
+        release_date: TBD
+    validations:
+      required: true
+  - type: textarea
+    id: requirements
+    attributes:
+      label: Requirements
+      description: Use two spaces for title continuations and fields, and four spaces for description content. Leave [] empty to create an Issue. The workflow maintains pull_requests.
+      value: |
+        - MiniMax M3.1 support
+          with vLLM-Ascend v0.32.0 []
 
-      **Release Branch**: 
+          description:
+            Integrate MiniMax M3.1 with vLLM-Ascend v0.32.0.
 
-      **Release Date**: 
+            Acceptance criteria:
+            - Complete model loading and inference.
+            - Verify cache reuse.
+            - Document the supported configuration.
 
-      **Release Manager**: 
-- type: textarea
-  attributes:
-    description: >
-      Release notes.
-    label: Prepare Release Note
-    value: >
-      - [ ] Create a new issue for release feedback
+          assignee:
 
-      - [ ] Write the release note PR.
+          pull_requests:
 
-        - [ ] Update the feedback issue link in docs/source/faqs.md
+        - Connector v2 integration
+          for the first release []
 
-        - [ ] Add release note to docs/source/user_guide/release_notes.md
+          description:
+            Complete the initial Connector v2 integration.
 
-        - [ ] Update version info in docs/source/community/versioning_policy.md
+            Scope:
+            - Define the connector interface.
+            - Implement the initial integration.
+            - Provide configuration examples.
 
-        - [ ] Update contributor info in docs/source/community/contributors.md
+            Acceptance criteria:
+            - Pass the functional tests.
+            - Document the interface and usage.
 
-        - [ ] Update package version in docs/conf.py
-- type: textarea
-  attributes:
-    description: >
-      Make sure the code is merged.
-    label: PR need Merge
-    value: >
-      - [ ] PR link1
+          assignee:
 
-      - [ ] PR link2
-
-      - [ ] ...
-- type: textarea
-  attributes:
-    description: >
-      Make sure the new Feature/Function is tested
-    label: Functional Test
-    value: >
-      - [ ] Feature1
-
-      - [ ] Bug1
-
-      - [ ] ...
-- type: textarea
-  attributes:
-    description: >
-      Make sure the doc is updated.
-    label: Doc Test
-    value: >
-      - [ ] Tutorial is updated.
-
-      - [ ] User Guide is updated.
-
-      - [ ] Developer Guide is updated.
-- type: textarea
-  attributes:
-    description: >
-      Make sure the artifacts is ready
-    label: Prepare Artifacts
-    value: >
-      - [ ] Docker image is ready.
-
-      - [ ] Wheel package is ready.
-- type: textarea
-  attributes:
-    description: >
-      Start to release.
-    label: Release Step
-    value: >
-      - [ ] Release note PR is merged.
-
-      - [ ] Post the release on GitHub release page.
-
-      - [ ] Generate official doc page on https://app.readthedocs.org/dashboard/
-
-      - [ ] Wait for the wheel package to be available on https://pypi.org/project/vllm-ascend
-
-      - [ ] Wait for the docker image to be available on https://quay.io/ascend/vllm-ascend
-
-      - [ ] Upload 310p wheel to Github release page
-
-      - [ ] Broadcast the release news (By message, blog , etc)
-
-      - [ ] Close this issue
+          pull_requests:
+    validations:
+      required: true
+  - type: textarea
+    id: release_notes
+    attributes:
+      label: Release Notes
+      description: Review and update this section.
+      value: |
+        - [ ] Summarize new features.
+        - [ ] Summarize bug fixes.
+        - [ ] Document compatibility changes.
+        - [ ] Document upgrade instructions.
+        - [ ] Document known issues.
+  - type: textarea
+    id: functional_tests
+    attributes:
+      label: Functional Tests
+      description: Review and update this section.
+      value: |
+        - [ ] Verify the requirements in this release.
+        - [ ] Verify the bug fixes targeted for this release.
+        - [ ] Record test results and evidence.
+        - [ ] Review unresolved bugs and release blockers.
+  - type: textarea
+    id: documentation_tests
+    attributes:
+      label: Documentation Tests
+      description: Review and update this section.
+      value: |
+        - [ ] Verify installation instructions.
+        - [ ] Verify configuration and usage examples.
+        - [ ] Update the user guide.
+        - [ ] Update the developer guide.
+  - type: textarea
+    id: artifacts
+    attributes:
+      label: Artifacts
+      description: Review and update this section.
+      value: |
+        - [ ] Build and verify the wheel package.
+        - [ ] Build and verify the container image.
+        - [ ] Confirm artifact versions match the release version.
+  - type: textarea
+    id: release_steps
+    attributes:
+      label: Release Steps
+      description: Review and update this section.
+      value: |
+        - [ ] Confirm the release scope.
+        - [ ] Merge the required pull requests.
+        - [ ] Complete requirement and bug fix verification.
+        - [ ] Resolve release blockers.
+        - [ ] Finalize the release notes.
+        - [ ] Run /release_ready and review the result.
+        - [ ] Run /release_publish.
+        - [ ] Verify the GitHub Release and tag.
+        - [ ] Publish the wheel package and container image.
+        - [ ] Verify the published artifacts.
+        - [ ] Confirm the milestone and release issue are closed.
+  - type: textarea
+    id: change_log
+    attributes:
+      label: Change Log
+      description: Review and update this section.
+      value: |
+        reason: Initial scope.

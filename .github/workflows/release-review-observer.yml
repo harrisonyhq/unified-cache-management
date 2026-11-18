@@ -1,0 +1,18 @@
+name: Release review observer
+
+on:
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  pull_request_review_comment:
+    types: [created, edited, deleted]
+
+permissions: {}
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      # A default-branch workflow_run receiver reads current API metadata.
+      # Fork review events need no credentials, checkout, or artifacts here.
+      - name: Notify release operations
+        run: ':'

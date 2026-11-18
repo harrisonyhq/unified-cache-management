@@ -6,16 +6,16 @@ body:
   - type: textarea
     id: report
     attributes:
-      label: 缺陷记录
+      label: Bug Report
       value: |
-        源版本主 Bug Issue：#
-        关联需求：#
-        测试代码或镜像：
-        引擎及版本、模型、硬件和配置：
-        复现步骤与命令：
-        预期结果：
-        实际结果：
-        复现频率：
-        日志、case 或报告链接：
+        source_bug_archive:
+        requirement:
+        tested_commit_or_image:
+        environment:
+        reproduction_steps:
+        expected_result:
+        actual_result:
+        frequency:
+        evidence:
     validations:
       required: true

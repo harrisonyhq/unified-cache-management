@@ -2,11 +2,14 @@ name: Release operations
 
 on:
   issue_comment:
-    types: [created]
+    types: [created, edited, deleted]
   issues:
     types: [opened, edited, labeled, milestoned, demilestoned, closed, reopened]
   pull_request_target:
-    types: [opened, edited, reopened, synchronize, closed]
+    types: [opened, edited, reopened, closed, ready_for_review, converted_to_draft]
+  workflow_run:
+    workflows: ['Release review observer']
+    types: [completed]
   schedule:
     - cron: '*/15 * * * *'
   workflow_dispatch:
@@ -24,7 +27,8 @@ jobs:
   operate:
     if: >-
       github.event_name != 'issue_comment' ||
-      (github.event.issue.pull_request == null &&
+      github.event.issue.pull_request != null ||
+      (github.event.action == 'created' &&
        (startsWith(github.event.comment.body, '/release_init') ||
         startsWith(github.event.comment.body, '/update') ||
         startsWith(github.event.comment.body, '/verify') ||

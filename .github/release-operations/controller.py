@@ -11,161 +11,21 @@ import subprocess
 import sys
 from pathlib import Path
 
+from associations import PullRequestAssociations
+from ownership import manual_mode, milestone_number
+from syntax import (
+    OperationError,
+    bind_entries,
+    field,
+    issue_reference,
+    parse_release,
+    patch_references,
+    scope_diff,
+)
+
 SUMMARY_MARKER = "<!-- ucm-release-summary:v1 -->"
 STATE_RE = re.compile(r"<!-- ucm-release-state:v1 ([A-Za-z0-9+/=]+) -->")
 ORIGIN = "<!-- ucm-origin:{release}:{key} -->"
-KEY_RE = re.compile(r"^(#{3,4})\s+(需求|子需求)\s+([a-zA-Z0-9][a-zA-Z0-9_-]*)\s*$")
-VERSION_RE = re.compile(r"\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?\Z")
-REF_RE = re.compile(
-    r"(?:https://github\.com/([\w.-]+/[\w.-]+)/issues/|(?:(\w[\w.-]*/[\w.-]+))?#)(\d+)"
-)
-
-
-class OperationError(ValueError):
-    pass
-
-
-def field(body: str, name: str) -> str:
-    match = re.search(r"^\s*" + re.escape(name) + r"\s*[:：]\s*(.*?)\s*$", body, re.M)
-    return match[1] if match else ""
-
-
-def issue_reference(value: str, repository: str) -> int | None:
-    if re.search(r"https?://", value) and "/issues/" not in value:
-        raise OperationError("需求引用必须是 GitHub Issue 链接")
-    matches = list(REF_RE.finditer(value))
-    if not matches:
-        if "#" in value or "/issues/" in value:
-            raise OperationError("无效 Issue 引用：" + value)
-        return None
-    if len(matches) != 1:
-        raise OperationError("每项需求填写一个 Issue 引用")
-    match = matches[0]
-    target = match[1] or match[2] or repository
-    if target.lower() != repository.lower():
-        raise OperationError("请在目标仓库管理该跨仓库需求：" + target)
-    return int(match[3])
-
-
-def parse_release(body: str, repository: str) -> dict:
-    version = field(body, "版本号")
-    if not VERSION_RE.fullmatch(version):
-        raise OperationError("版本号采用 0.11.0 这样的格式")
-    starts = [
-        (i, KEY_RE.fullmatch(line.strip())) for i, line in enumerate(body.splitlines())
-    ]
-    starts = [(i, match) for i, match in starts if match]
-    lines = body.splitlines()
-    entries, parent, keys, references = [], None, set(), set()
-    for offset, (start, match) in enumerate(starts):
-        end = starts[offset + 1][0] if offset + 1 < len(starts) else len(lines)
-        section_lines = lines[start + 1 : end]
-        # A following top-level section terminates the last requirement.
-        for index, line in enumerate(section_lines):
-            if re.match(r"^#{1,2}\s", line):
-                section_lines = section_lines[:index]
-                break
-        section = "\n".join(section_lines)
-        key, kind = match[3], match[2]
-        if key in keys:
-            raise OperationError("重复条目标识：" + key)
-        keys.add(key)
-        if kind == "需求":
-            if len(match[1]) != 3:
-                raise OperationError("父需求使用 ### 需求 <稳定标识>")
-            parent = key
-            parent_key = None
-        else:
-            if len(match[1]) != 4 or parent is None:
-                raise OperationError("子需求使用 #### 子需求 <稳定标识>，放在父需求下")
-            parent_key = parent
-        title = field(section, "需求")
-        if not title:
-            raise OperationError("条目缺少需求标题或引用：" + key)
-        number = issue_reference(title, repository)
-        if number is not None:
-            if number in references:
-                raise OperationError("同一 Issue 在范围中出现多次")
-            references.add(number)
-        people = {}
-        for role in ("开发负责人", "验证负责人"):
-            value = field(section, role)
-            if value in ("", "待指定", "待定", "TBD"):
-                people[role] = None
-            elif re.fullmatch(r"@[A-Za-z0-9][A-Za-z0-9-]*", value):
-                people[role] = value[1:]
-            else:
-                raise OperationError(role + "填写单个 @账号或待指定：" + key)
-        title_text = re.sub(r"\s*[（(]#\d+[）)]\s*$", "", title)
-        if number and title_text == title:
-            title_text = None
-        entries.append(
-            {
-                "key": key,
-                "parent": parent_key,
-                "title": title,
-                "title_text": title_text,
-                "number": number,
-                "developer": people["开发负责人"],
-                "verifier": people["验证负责人"],
-                "acceptance": field(section, "验收要求"),
-            }
-        )
-    return {
-        "version": version,
-        "entries": entries,
-        "change_note": field(body, "变更说明"),
-    }
-
-
-def scope_diff(previous: dict, entries: list[dict]) -> dict:
-    current = {entry["key"]: entry for entry in entries}
-    changed = []
-    for key in current.keys() & previous.keys():
-        # Titles with inserted references normalize to the real Issue ID.
-        before, after = previous[key], current[key]
-        content_changed = any(
-            before.get(name) != after.get(name)
-            for name in ("parent", "developer", "verifier", "acceptance")
-        )
-        if after.get("number") and before.get("number") != after["number"]:
-            raise OperationError("条目标识已绑定其他 Issue：" + key)
-        if not after.get("number") and before.get("title") != after["title"]:
-            content_changed = True
-        if after.get("title_text") and before.get("title_text") != after["title_text"]:
-            content_changed = True
-        if content_changed:
-            changed.append(key)
-    return {
-        "added": sorted(current.keys() - previous.keys()),
-        "removed": sorted(previous.keys() - current.keys()),
-        "changed": sorted(changed),
-    }
-
-
-def patch_references(body: str, mappings: dict[str, int], repository: str) -> str:
-    lines, key = body.splitlines(), None
-    for index, line in enumerate(lines):
-        match = KEY_RE.fullmatch(line.strip())
-        if match:
-            key = match[3]
-        elif re.match(r"^#{1,2}\s", line):
-            key = None
-        elif key in mappings and re.match(r"^\s*需求\s*[:：]", line):
-            if issue_reference(field(line, "需求"), repository) is None:
-                lines[index] = line.rstrip() + f"（#{mappings[key]}）"
-    return "\n".join(lines) + ("\n" if body.endswith("\n") else "")
-
-
-def milestone_number(issue: dict) -> int | None:
-    return issue["milestone"]["number"] if issue.get("milestone") else None
-
-
-def manual_mode(record: dict, current: int | None, human_event: bool = False) -> dict:
-    updated = dict(record)
-    if human_event or ("last" in record and current != record["last"]):
-        updated.update(mode="manual", last=current)
-    return updated
 
 
 def bug_progress(
@@ -236,7 +96,7 @@ class GitHub:
         )["data"]
 
 
-class Controller:
+class Controller(PullRequestAssociations):
     def __init__(self, api: GitHub, config: dict):
         self.api, self.config = api, config
         self.repository = config["repository"]
@@ -277,12 +137,25 @@ class Controller:
         }
         if comment and (match := STATE_RE.search(comment["body"])):
             state = json.loads(base64.b64decode(match[1]).decode("utf-8"))
+        # Read historical snapshots without replaying the old requirement grammar.
+        state["scope"] = {
+            f"issue-{e['number']}": dict(
+                {
+                    k: v
+                    for k, v in e.items()
+                    if k not in ("parent", "verifier", "acceptance")
+                },
+                key=f"issue-{e['number']}",
+                description=e.get("description", e.get("acceptance", "")),
+            )
+            for e in state["scope"].values()
+        }
         return comment, state
 
     def save(self, release: int, state: dict, result: str):
         rows = []
         for key, entry in state["scope"].items():
-            parent = "子需求" if entry["parent"] else "需求"
+            kind = "Requirement"
             observed = state.get("observed", {}).get(str(entry["number"]), {})
             validation = (
                 state.get("verification", {})
@@ -290,7 +163,7 @@ class Controller:
                 .get("result", "待验证")
             )
             rows.append(
-                f"| {parent} `{key}` | #{entry['number']} | @{entry['developer']} | @{entry['verifier']} | {observed.get('state', 'open')} / {validation} |"
+                f"| {kind} | #{entry['number']} | @{entry.get('developer')} | {observed.get('state', 'open')} / {validation} |"
             )
         serialized = base64.b64encode(
             json.dumps(state, ensure_ascii=False, separators=(",", ":")).encode()
@@ -306,7 +179,7 @@ class Controller:
         if state.get("archive"):
             body += f"主 Bug Issue：#{state['archive']}\n\n"
         body += (
-            "| 条目 | Issue | 开发负责人 | 验证负责人 | 状态 / 验证 |\n| --- | --- | --- | --- | --- |\n"
+            "| Item | Issue | Assignee | State / Validation |\n| --- | --- | --- | --- |\n"
             + "\n".join(rows)
         )
         body = body.replace("@None", "待指定")
@@ -315,6 +188,12 @@ class Controller:
             body += f"| Bug #{number} | {record.get('target_title') or '待定'} | {record['mode']} |\n"
         for number, record in state.get("prs", {}).items():
             body += f"| PR #{number} | {record.get('target_title') or '待定'} | {record['mode']} |\n"
+            for target, sources in record.get("sources", {}).items():
+                body += (
+                    f"\nIssue #{target}: "
+                    + ", ".join(f"[reference]({url})" for url in dict.fromkeys(sources))
+                    + "\n"
+                )
         if state.get("readiness"):
             body += (
                 "\n\n### 最近发布准入\n\n```json\n"
@@ -338,9 +217,16 @@ class Controller:
             raise OperationError("初始化至少填写一个需求")
         diff = scope_diff(state["scope"], parsed["entries"])
         if diff["removed"] and not parsed["change_note"]:
-            raise OperationError("移出需求时填写‘变更说明：原因’")
+            raise OperationError(
+                "Fill reason: in Change Log when removing requirements"
+            )
+        for role in ("release_manager", "test_lead"):
+            login = parsed["metadata"].get(role, "").lstrip("@")
+            if login:
+                self.api.call("users/" + login)
+        self.api.rest("commits/" + parsed["metadata"]["branch"])
         for entry in parsed["entries"]:
-            for login in (entry["developer"], entry["verifier"]):
+            for login in (entry["developer"],):
                 if login:
                     self.api.call("users/" + login)
             existing_number = entry["number"] or state["objects"].get(entry["key"])
@@ -367,25 +253,6 @@ class Controller:
                     and assigned != {previous_developer}
                 ):
                     raise OperationError(f"#{existing['number']} 的负责人存在冲突")
-                if entry["parent"]:
-                    parent_entry = next(
-                        e for e in parsed["entries"] if e["key"] == entry["parent"]
-                    )
-                    desired_parent = parent_entry["number"] or state["objects"].get(
-                        parent_entry["key"]
-                    )
-                    previous_parent = state["scope"].get(entry["key"], {}).get("parent")
-                    previous_number = (
-                        state["scope"].get(previous_parent, {}).get("number")
-                    )
-                    current_parent = self.parent(existing["number"])
-                    if current_parent and current_parent["number"] not in (
-                        desired_parent,
-                        previous_number,
-                    ):
-                        raise OperationError(
-                            f"#{existing['number']} 已属于其他父需求 #{current_parent['number']}"
-                        )
         return diff
 
     def create_or_recover(
@@ -453,12 +320,33 @@ class Controller:
         _, state = self.load(release)
         try:
             parsed = parse_release(source["body"], self.repository)
+            source_entries = parsed["entries"]
+            parsed["entries"] = bind_entries(source_entries, state["objects"])
             if command == "update" and not state.get("initialized"):
                 raise OperationError("先执行 /release_init")
             diff = self.validate(parsed, release, state)
+            if state.get("initialized") and state.get("metadata") != parsed["metadata"]:
+                diff["metadata"] = ["Release Information"]
             plan = json.dumps(diff, ensure_ascii=False)
             if dry_run:
-                self.save(release, state, f"预览 `{command}`\n\n```json\n{plan}\n```")
+                actions = [
+                    f"- {'Reuse' if e['number'] else 'Create'} Issue: {e['title']}"
+                    + (f" (#{e['number']})" if e["number"] else "")
+                    for e in parsed["entries"]
+                ]
+                self.save(
+                    release,
+                    state,
+                    f"预览 `{command}`\n\nMilestone: {parsed['version']}\n\nBug Archive: "
+                    + (
+                        f"reuse #{state['archive']}"
+                        if state.get("archive")
+                        else "create or recover"
+                    )
+                    + "\n\n"
+                    + "\n".join(actions)
+                    + f"\n\n```json\n{plan}\n```",
+                )
                 return
             if (
                 command == "update"
@@ -478,6 +366,8 @@ class Controller:
                 return
             self.save(release, state, f"执行中：`/{command}`\n\n{plan}")
             state["version"] = parsed["version"]
+            state["metadata"] = parsed["metadata"]
+            state["schema"] = 2
             if not state.get("milestone"):
                 matches = [
                     m
@@ -498,12 +388,27 @@ class Controller:
                 )
                 self.save(release, state, "执行中：Milestone 已记录")
             target = state["milestone"]["number"]
-            self.api.rest(f"issues/{release}", "PATCH", {"milestone": target})
+            metadata = parsed["metadata"]
+            milestone_fields = {
+                "description": f"Release tracking: #{release}\nGoal: {metadata.get('goal', '')}\nRelease manager: {metadata.get('release_manager', '')}\nTest lead: {metadata.get('test_lead', '')}",
+                "due_on": (
+                    metadata["release_date"] + "T23:59:59Z"
+                    if metadata.get("release_date") not in (None, "", "TBD")
+                    else None
+                ),
+            }
+            state["milestone"] = self.api.rest(
+                f"milestones/{target}", "PATCH", milestone_fields
+            )
+            release_fields = {"milestone": target}
+            if metadata.get("release_manager"):
+                release_fields["assignees"] = [metadata["release_manager"].lstrip("@")]
+            self.api.rest(f"issues/{release}", "PATCH", release_fields)
             archive = self.create_or_recover(
                 release,
                 "__bugs__",
-                f"[Bug Archive] UCM {parsed['version']} 测试问题",
-                f"源版本：{parsed['version']}\nRelease：#{release}\n\n在此创建 Bug Sub-issues，默认目标版本为 {parsed['version']}。",
+                f"[Bug Archive] UCM {parsed['version']}",
+                f"Source version: {parsed['version']}\nRelease: #{release}\n\nCreate Bug sub-issues here. The default fix version is {parsed['version']}.",
                 ["release-bug-archive"],
                 state,
             )
@@ -520,38 +425,24 @@ class Controller:
                         release,
                         key,
                         entry["title"],
-                        f"Release：#{release}\n验收要求：{entry['acceptance']}\n验证负责人：@{entry['verifier']}".replace(
-                            "@None", "待指定"
-                        ),
+                        f"Release: #{release}\n\n{entry['description']}",
                         ["requirement"],
                         state,
                     )
                 )
-                entry = dict(entry, number=item["number"])
+                source_key = key
+                key = f"issue-{item['number']}"
+                entry = dict(entry, key=key, number=item["number"])
+                state["objects"][source_key] = item["number"]
                 state["objects"][key] = item["number"]
                 desired[key] = entry
                 previous = state["scope"].get(key, {})
-                if entry["parent"]:
-                    old_parent = (
-                        state["scope"].get(previous.get("parent"), {}).get("number")
-                    )
-                    self.attach(item, desired[entry["parent"]]["number"], old_parent)
-                elif previous.get("parent"):
-                    raise OperationError("子需求升级为顶层需求时，请先明确移除原父关系")
                 payload = {"milestone": target}
-                if key in diff["changed"] and entry.get("title_text"):
-                    payload["title"] = entry["title_text"]
-                if entry["developer"]:
-                    payload["assignees"] = [entry["developer"]]
-                self.api.rest(f"issues/{item['number']}", "PATCH", payload)
-                if key in diff["changed"]:
-                    self.api.rest(
-                        f"issues/{item['number']}/comments",
-                        "POST",
-                        {
-                            "body": f"版本范围更新，Release #{release}\n验收要求：{entry['acceptance']}\n验证负责人：{entry['verifier'] or '待指定'}"
-                        },
+                if entry["developer"] or previous.get("developer"):
+                    payload["assignees"] = (
+                        [entry["developer"]] if entry["developer"] else []
                     )
+                self.api.rest(f"issues/{item['number']}", "PATCH", payload)
                 self.save(release, state, f"执行中：已关联 `{key}` → #{item['number']}")
             for key in diff["removed"]:
                 item = self.issue(state["scope"][key]["number"])
@@ -561,7 +452,13 @@ class Controller:
                     )
             latest = self.issue(release)
             latest_parsed = parse_release(latest["body"], self.repository)
-            if latest_parsed != parsed:
+            latest_parsed["entries"] = bind_entries(
+                latest_parsed["entries"], state["objects"]
+            )
+            expected = dict(
+                parsed, entries=bind_entries(source_entries, state["objects"])
+            )
+            if latest_parsed != expected:
                 raise OperationError(
                     "执行期间正文已修改；已记录成功对象，请重新执行同步"
                 )
@@ -640,7 +537,9 @@ class Controller:
         for bug in self.api.pages("issues?state=all&labels=bug"):
             if "pull_request" in bug:
                 continue
-            source = field(bug.get("body") or "", "源版本主 Bug Issue")
+            source = field(bug.get("body") or "", "source_bug_archive") or field(
+                bug.get("body") or "", "源版本主 Bug Issue"
+            )
             try:
                 archive_number = (
                     issue_reference(source, self.repository) if source else None
@@ -684,61 +583,7 @@ class Controller:
             if "bug" not in {label["name"] for label in bug["labels"]}:
                 self.api.rest(f"issues/{number}/labels", "POST", {"labels": ["bug"]})
         self.save(release, state, "同步中：Bug 默认版本与人工指定已记录")
-        bug_numbers = {bug["number"] for bug in bugs}
-        prs = self.api.pages("pulls?state=all")
-        for pr in prs:
-            relation = field(pr.get("body") or "", "关联缺陷")
-            refs = []
-            try:
-                for match in REF_RE.finditer(relation):
-                    refs.append(issue_reference(match[0], self.repository))
-            except OperationError as error:
-                problems.append(f"PR #{pr['number']}：{error}")
-                continue
-            if not (set(refs) & bug_numbers) and str(pr["number"]) not in state["prs"]:
-                continue
-            linked = [self.issue(n) for n in refs]
-            if any(
-                "bug" not in {label["name"] for label in bug["labels"]}
-                for bug in linked
-            ):
-                raise OperationError("修复 PR 的关联缺陷需要 bug 标签")
-            targets = {milestone_number(bug) for bug in linked}
-            number = str(pr["number"])
-            current = milestone_number(pr)
-            record = state["prs"].get(
-                number,
-                {"mode": "auto" if current is None else "manual", "last": current},
-            )
-            record = manual_mode(
-                record,
-                current,
-                bool(
-                    human and milestone_event and event_pr.get("number") == pr["number"]
-                ),
-            )
-            record = self.milestone_history(pr["number"], record)
-            record["bugs"] = refs
-            record["merged"] = bool(pr.get("merged_at"))
-            if len(targets) > 1:
-                problems.append(
-                    f"PR #{number} 关联 Bug 的目标版本冲突，请指定 PR Milestone"
-                )
-            elif record["mode"] == "auto":
-                desired = next(iter(targets), None)
-                if current != desired:
-                    self.api.rest(f"issues/{number}", "PATCH", {"milestone": desired})
-                record["last"] = desired
-            elif targets and current not in targets:
-                problems.append(f"PR #{number} 使用人工目标，与关联 Bug 的目标版本不同")
-            state["prs"][number] = record
-            if record["mode"] == "auto" and len(targets) <= 1:
-                record["target_title"] = (
-                    (linked[0].get("milestone") or {}).get("title") if linked else None
-                )
-            else:
-                record["target_title"] = (pr.get("milestone") or {}).get("title")
-            self.project_item(pr, "Bugfix")
+        problems.extend(self.sync_pull_requests(release, state, event))
         for bug in bugs:
             number = str(bug["number"])
             related = {
@@ -814,7 +659,10 @@ class Controller:
             raise OperationError("验证对象属于当前版本的需求或源归档 Bug")
         item = self.issue(number)
         repository = self.api.rest("")
-        tested_commit = self.api.rest("commits/" + repository["default_branch"])["sha"]
+        tested_commit = self.api.rest(
+            "commits/"
+            + state.get("metadata", {}).get("branch", repository["default_branch"])
+        )["sha"]
         result = "Passed" if passed else "Failed"
         body = f"<!-- ucm-verification:v1 -->\n验证对象：#{number}\n目标 Milestone：{milestone_number(item)}\n测试代码：{tested_commit}\n结果：{result}\n证据：{evidence}\n验证者：@{actor}"
         self.api.rest(f"issues/{number}/comments", "POST", {"body": body})
@@ -873,7 +721,11 @@ class Controller:
         source = self.issue(release)
         current_plan = parse_release(source["body"], self.repository)
         delta = scope_diff(state["scope"], current_plan["entries"])
-        if current_plan["version"] != state["version"] or any(delta.values()):
+        if (
+            current_plan["version"] != state["version"]
+            or any(delta.values())
+            or current_plan["metadata"] != state.get("metadata")
+        ):
             return state, {
                 "status": "blocked",
                 "reason": "正文范围待 /update 同步",
@@ -888,7 +740,9 @@ class Controller:
         ]
         pending = []
         repo = self.api.rest("")
-        head = self.api.rest("commits/" + repo["default_branch"])["sha"]
+        head = self.api.rest(
+            "commits/" + state.get("metadata", {}).get("branch", repo["default_branch"])
+        )["sha"]
         for item in {i["number"]: i for i in items}.values():
             record = state.get("verification", {}).get(str(item["number"]), {})
             if (
@@ -902,6 +756,11 @@ class Controller:
             return state, {"status": "blocked", "pending": pending}
         pending_prs = []
         for number, record in state["prs"].items():
+            if not record.get("requirements") and not record.get("bugs"):
+                continue
+            if record.get("conflict"):
+                pending_prs.append(int(number))
+                continue
             if record.get("last") != target:
                 continue
             pr = self.api.rest("pulls/" + number)
@@ -927,7 +786,10 @@ class Controller:
         repo = self.api.rest("")
         commit = (
             state.get("published", {}).get("commit")
-            or self.api.rest("commits/" + repo["default_branch"])["sha"]
+            or self.api.rest(
+                "commits/"
+                + state.get("metadata", {}).get("branch", repo["default_branch"])
+            )["sha"]
         )
         tag = "v" + state["version"]
         existing = [r for r in self.api.pages("releases") if r["tag_name"] == tag]
@@ -1034,7 +896,8 @@ class Controller:
 
     def handle(self, event: dict, event_name: str, replay=False):
         if event_name == "issue_comment":
-            if event.get("issue", {}).get("pull_request"):
+            if "pull_request" in event.get("issue", {}):
+                self.reconcile_all(event)
                 return
             command = event["comment"]["body"].strip()
             if not command.startswith(
@@ -1101,9 +964,26 @@ class Controller:
             )
             self.save(release, latest, result)
         else:
-            for release in self.releases():
+            self.reconcile_all(event)
+
+    def reconcile_all(self, event=None):
+        errors = []
+        self._pr_snapshot = self.api.pages("pulls?state=all")
+        self._discussion_snapshot = {}
+        for release in self.releases():
+            try:
                 self.drain_commands(release)
                 self.reconcile(release, event)
+            except OperationError as error:
+                _, state = self.load(release)
+                self.save(
+                    release, state, "Synchronization requires attention: " + str(error)
+                )
+                errors.append(f"Release #{release}: {error}")
+        self._pr_snapshot = None
+        self._discussion_snapshot = None
+        if errors:
+            raise OperationError("\n".join(errors))
 
 
 def main():
