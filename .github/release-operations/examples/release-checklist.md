@@ -10,7 +10,7 @@ release_date: TBD
 ### Requirements
 
 - MiniMax M3.1 support
-  with vLLM-Ascend v0.32.0 []
+  with vLLM-Ascend v0.32.0 [Issue]()
 
   description:
     Integrate MiniMax M3.1 with vLLM-Ascend v0.32.0.
@@ -25,7 +25,7 @@ release_date: TBD
   pull_requests:
 
 - Connector v2 integration
-  for the first release []
+  for the first release [Issue]()
 
   description:
     Complete the initial Connector v2 integration.
