@@ -110,6 +110,13 @@ class ParserContracts(unittest.TestCase):
         self.assertEqual(parse_release(patched, REPOSITORY)["entries"], before)
         self.assertEqual(patch_references(patched, {}, REPOSITORY), patched)
 
+    def test_writeback_preserves_brackets_in_multiline_title(self):
+        body = PLAN.replace("- Connector v2", "- Connector [v2]")
+        key = parse_release(body, REPOSITORY)["entries"][0]["key"]
+        patched = patch_references(body, {key: 14}, REPOSITORY)
+        self.assertIn("- Connector [v2]\n  initial integration [#14]", patched)
+        self.assertEqual(parse_release(patched, REPOSITORY)["entries"][0]["number"], 14)
+
     def test_pr_refresh_normalizes_legacy_full_url_without_scope_changes(self):
         body = PLAN.replace(
             "initial integration []",

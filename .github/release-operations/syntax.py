@@ -256,16 +256,17 @@ def patch_references(body, mappings, repository):
         number = entry["number"] or mappings.get(entry["key"])
         if not number:
             continue
-        for i in range(start, end):
-            if lines[i] == "  description:":
-                break
+        title_end = next(i for i in range(start, end) if lines[i] == "  description:")
+        for i in reversed(range(start, title_end)):
+            if not lines[i].strip():
+                continue
             if re.search(r"\[[^\[\]]*\][ \t]*$", lines[i]):
                 lines[i] = re.sub(
                     r"\[[^\[\]]*\][ \t]*$",
                     f"[#{number}]",
                     lines[i],
                 )
-                break
+            break
     return "\n".join(lines) + ("\n" if body.endswith("\n") else "")
 
 
