@@ -253,20 +253,25 @@ def patch_references(body, mappings, repository):
     parsed = parse_release(body, repository)
     lines, ranges = blocks(body)
     for entry, (start, end) in zip(parsed["entries"], ranges):
-        if entry["number"] or entry["key"] not in mappings:
+        number = entry["number"] or mappings.get(entry["key"])
+        if not number:
             continue
-        for i in range(start, end):
-            if re.search(r"\[\]\s*$", lines[i]):
+        title_end = next(i for i in range(start, end) if lines[i] == "  description:")
+        for i in reversed(range(start, title_end)):
+            if not lines[i].strip():
+                continue
+            if re.search(r"\[[^\[\]]*\][ \t]*$", lines[i]):
                 lines[i] = re.sub(
-                    r"\[\]\s*$",
-                    f"[https://github.com/{repository}/issues/{mappings[entry['key']]}]",
+                    r"\[[^\[\]]*\][ \t]*$",
+                    f"[#{number}]",
                     lines[i],
                 )
-                break
+            break
     return "\n".join(lines) + ("\n" if body.endswith("\n") else "")
 
 
 def patch_pull_requests(body, rows, repository):
+    body = patch_references(body, {}, repository)
     parsed = parse_release(body, repository)
     lines, ranges = blocks(body)
     for entry, (start, end) in reversed(list(zip(parsed["entries"], ranges))):
