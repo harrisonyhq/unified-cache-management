@@ -1,139 +1,197 @@
 import copy
 import unittest
+from pathlib import Path
 
-from controller import (
-    Controller,
-    GitHub,
+from controller import Controller, GitHub, bug_progress, manual_mode
+from syntax import (
     OperationError,
-    bug_progress,
+    bind_entries,
+    field,
     issue_reference,
-    manual_mode,
     parse_release,
+    patch_pull_requests,
     patch_references,
+    references,
     scope_diff,
 )
 
 REPOSITORY = "harrisonyhq/unified-cache-management"
-PLAN = """## 版本信息
-版本号：0.11.0
-### 需求 connector
-需求：Connector v2 首批上库
-开发负责人：@harrisonyhq
-验证负责人：待指定
-验收要求：验收整体调用路径
-#### 子需求 contract
-需求：Connector v2 接口契约
-开发负责人：待指定
-验证负责人：@harrisonyhq
-验收要求：通过契约测试
-## 变更记录
-变更说明：初始范围
+PLAN = """### Release Information
+
+version: 0.12.0
+branch: main
+goal: Deliver the connector.
+release_manager: @harrisonyhq
+test_lead:
+release_date: TBD
+
+### Requirements
+
+- Connector v2
+  initial integration []
+
+  description:
+    Implement the connector.
+
+    Acceptance criteria:
+    - Pass the integration test.
+    - Document the interface.
+
+  assignee: @harrisonyhq
+
+  pull_requests:
+
+- Store interface []
+
+  description:
+    Implement the first interface.
+
+  assignee:
+
+  pull_requests:
+
+### Change Log
+
+reason: Initial scope.
 """
 
 
 class ParserContracts(unittest.TestCase):
-    def test_repository_root_endpoint_has_no_trailing_slash(self):
+    def test_multiline_title_description_and_empty_fields(self):
+        parsed = parse_release(PLAN, REPOSITORY)
+        self.assertEqual(
+            parsed["entries"][0]["title"], "Connector v2 initial integration"
+        )
+        self.assertIn(
+            "\n\nAcceptance criteria:\n- Pass", parsed["entries"][0]["description"]
+        )
+        self.assertIsNone(parsed["entries"][1]["developer"])
+        self.assertEqual(field("assignee:\nnext: @someone", "assignee"), "")
+        self.assertEqual(parsed["metadata"]["test_lead"], "")
+
+    def test_actual_release_checklist_is_english_and_parses(self):
+        root = Path(__file__).parent
+        example = (root / "examples/release-checklist.md").read_text()
+        template = (
+            root.parent / "ISSUE_TEMPLATE/900-release-checklist.yml"
+        ).read_text()
+        self.assertTrue(example.isascii())
+        self.assertTrue(template.isascii())
+        self.assertEqual(len(parse_release(example, REPOSITORY)["entries"]), 2)
+        self.assertNotIn("### Pull Requests", example)
+        self.assertFalse((root.parent / "ISSUE_TEMPLATE/010-release-plan.yml").exists())
+
+    def test_only_requirements_section_is_parsed(self):
+        value = PLAN.replace(
+            "### Change Log", "### Functional Tests\n\n- [ ] A test\n\n### Change Log"
+        )
+        self.assertEqual(len(parse_release(value, REPOSITORY)["entries"]), 2)
+
+    def test_reference_writeback_is_idempotent_and_preserves_description(self):
+        entries = parse_release(PLAN, REPOSITORY)["entries"]
+        mappings = {e["key"]: n for e, n in zip(entries, [14, 13])}
+        patched = patch_references(PLAN, mappings, REPOSITORY)
+        self.assertIn("/issues/14]", patched)
+        self.assertEqual(patch_references(patched, mappings, REPOSITORY), patched)
+        actual = parse_release(patched, REPOSITORY)["entries"]
+        self.assertEqual([e["key"] for e in actual], ["issue-14", "issue-13"])
+        self.assertEqual(actual[0]["description"], entries[0]["description"])
+        previous = {e["key"]: e for e in bind_entries(entries, mappings)}
+        self.assertFalse(any(scope_diff(previous, actual).values()))
+
+    def test_existing_references_and_issue15_regression(self):
+        body = PLAN.replace(
+            "Connector v2\n  initial integration []",
+            "Support GLM5.5 [https://github.com/" + REPOSITORY + "/issues/14]",
+        )
+        body = body.replace("Store interface []", "SGLang EPD [#13]")
+        self.assertEqual(
+            [e["number"] for e in parse_release(body, REPOSITORY)["entries"]], [14, 13]
+        )
+
+    def test_invalid_input_reports_line_before_creation(self):
+        for bad in [
+            PLAN.replace("  description:", " description:", 1),
+            PLAN.replace("    Implement the connector.", "  Implement the connector."),
+            PLAN.replace("  assignee: @harrisonyhq", "  assignee: @a @b"),
+            PLAN.replace(
+                "  assignee: @harrisonyhq",
+                "  assignee: @harrisonyhq\n  assignee: @other",
+            ),
+            PLAN.replace("integration []", "integration"),
+            PLAN.replace("Store interface []", "Store interface [#abc]"),
+            PLAN.replace(
+                "Store interface []",
+                "Store interface [https://github.com/a/b/issues/1]",
+            ),
+            PLAN.replace(
+                "Store interface []",
+                "Store interface [https://github.com/" + REPOSITORY + "/pull/1]",
+            ),
+            PLAN.replace("Store interface []", "Connector v2 initial integration []"),
+        ]:
+            with self.subTest(body=bad), self.assertRaises(OperationError):
+                parse_release(bad, REPOSITORY)
+
+    def test_mention_collection_filters_cross_repository_and_pr_links(self):
+        text = (
+            "#14, fixes #8; "
+            + REPOSITORY
+            + "#16 https://github.com/"
+            + REPOSITORY
+            + "/issues/17"
+        )
+        text += (
+            " other/repo#22 [#99](https://github.com/"
+            + REPOSITORY
+            + "/pull/99) https://docs.test/topic#55"
+        )
+        self.assertEqual(references(text, REPOSITORY), {8, 14, 16, 17})
+
+    def test_pr_display_does_not_change_scope(self):
+        body = patch_references(
+            PLAN, {parse_release(PLAN, REPOSITORY)["entries"][0]["key"]: 14}, REPOSITORY
+        )
+        before = parse_release(body, REPOSITORY)["entries"]
+        updated = patch_pull_requests(
+            body, {14: [{"number": 33, "state": "open", "merged_at": None}]}, REPOSITORY
+        )
+        self.assertIn("| open", updated)
+        self.assertEqual(before, parse_release(updated, REPOSITORY)["entries"])
+        self.assertEqual(
+            patch_pull_requests(
+                updated,
+                {14: [{"number": 33, "state": "open", "merged_at": None}]},
+                REPOSITORY,
+            ),
+            updated,
+        )
+
+    def test_repository_root_endpoint(self):
         api = GitHub(REPOSITORY)
         api.call = lambda path, method, data: path
         self.assertEqual(api.rest(""), "repos/" + REPOSITORY)
-        self.assertEqual(api.rest("issues/12"), "repos/" + REPOSITORY + "/issues/12")
 
-    def test_parent_and_children_are_unambiguous(self):
-        parsed = parse_release(PLAN, REPOSITORY)
-        self.assertEqual(parsed["version"], "0.11.0")
-        self.assertIsNone(parsed["entries"][0]["parent"])
-        self.assertEqual(parsed["entries"][1]["parent"], "connector")
-        self.assertEqual(parsed["entries"][1]["verifier"], "harrisonyhq")
-        self.assertEqual(parsed["entries"][1]["acceptance"], "通过契约测试")
-
-    def test_reference_insertion_round_trips_and_preserves_text(self):
-        patched = patch_references(PLAN, {"connector": 12, "contract": 13}, REPOSITORY)
-        self.assertIn("需求：Connector v2 首批上库（#12）", patched)
-        self.assertIn("需求：Connector v2 接口契约（#13）", patched)
-        self.assertIn("验收要求：通过契约测试", patched)
+    def test_release_date_validation(self):
         self.assertEqual(
-            patch_references(patched, {"connector": 12, "contract": 13}, REPOSITORY),
-            patched,
+            parse_release(
+                PLAN.replace("release_date: TBD", "release_date: 2026-12-01"),
+                REPOSITORY,
+            )["metadata"]["release_date"],
+            "2026-12-01",
         )
-        self.assertEqual(
-            [e["number"] for e in parse_release(patched, REPOSITORY)["entries"]],
-            [12, 13],
-        )
-
-    def test_existing_issue_reference_formats(self):
-        for value in [
-            "#12",
-            REPOSITORY + "#12",
-            "https://github.com/" + REPOSITORY + "/issues/12",
-            "[已有需求](https://github.com/" + REPOSITORY + "/issues/12)",
-            "需求名称（#12）",
-        ]:
-            with self.subTest(value=value):
-                self.assertEqual(issue_reference(value, REPOSITORY), 12)
-
-    def test_invalid_references_never_become_new_titles(self):
-        for value in ["#abc", "https://github.com/a/b/pull/12", "a/b#12", "#12 #13"]:
-            with self.subTest(value=value), self.assertRaises(OperationError):
-                issue_reference(value, REPOSITORY)
-
-    def test_duplicate_keys_and_orphan_children_are_rejected(self):
         with self.assertRaises(OperationError):
             parse_release(
-                PLAN.replace("子需求 contract", "子需求 connector"), REPOSITORY
+                PLAN.replace("release_date: TBD", "release_date: tomorrow"), REPOSITORY
             )
-        with self.assertRaises(OperationError):
-            parse_release(
-                PLAN.replace("### 需求 connector", "#### 子需求 connector"), REPOSITORY
-            )
-
-    def test_scope_changes_do_not_confuse_reference_patches_with_edits(self):
-        original = parse_release(PLAN, REPOSITORY)["entries"]
-        previous = {e["key"]: dict(e, number=n) for e, n in zip(original, [12, 13])}
-        patched = parse_release(
-            patch_references(PLAN, {"connector": 12, "contract": 13}, REPOSITORY),
-            REPOSITORY,
-        )
-        self.assertEqual(
-            scope_diff(previous, patched["entries"]),
-            {"added": [], "removed": [], "changed": []},
-        )
-        shortened = patched["entries"][:1]
-        shortened[0]["acceptance"] = "新的验收条件"
-        self.assertEqual(
-            scope_diff(previous, shortened),
-            {"added": [], "removed": ["contract"], "changed": ["connector"]},
-        )
-
-    def test_reusing_a_key_for_another_issue_is_rejected(self):
-        entries = parse_release(PLAN, REPOSITORY)["entries"]
-        previous = {entries[0]["key"]: dict(entries[0], number=12)}
-        with self.assertRaises(OperationError):
-            scope_diff(previous, [dict(entries[0], number=99)])
-
-
-class MilestoneOwnership(unittest.TestCase):
-    def test_manual_clear_is_persistent(self):
-        record = manual_mode({"mode": "auto", "last": 1}, None)
-        self.assertEqual(record, {"mode": "manual", "last": None})
-        self.assertEqual(manual_mode(record, None), record)
-
-    def test_human_event_takes_ownership_even_when_value_matches(self):
-        self.assertEqual(
-            manual_mode({"mode": "auto", "last": 1}, 1, True)["mode"], "manual"
-        )
-
-    def test_automatic_readback_preserves_automatic_mode(self):
-        self.assertEqual(manual_mode({"mode": "auto", "last": 1}, 1)["mode"], "auto")
 
 
 class MemoryGitHub:
-    """Repository fixture with real Issue IDs and native parent relationships."""
-
     def __init__(self):
-        self.items = {1: self.make_issue(1, "[Release] UCM 0.11.0", PLAN, ["release"])}
-        self.comments = []
-        self.milestones = []
-        self.parents = {}
+        self.items = {1: self.make_issue(1, "[Release] UCM 0.12.0", PLAN, ["release"])}
+        self.comments, self.milestones, self.parents = [], [], {}
+        self.prs, self.reviews, self.inline, self.events = {}, {}, {}, {}
+        self.projects = {}
         self.lose_response_for = None
 
     @staticmethod
@@ -148,6 +206,7 @@ class MemoryGitHub:
             "assignees": [],
             "state": "open",
             "node_id": f"I_{number}",
+            "html_url": f"https://github.com/{REPOSITORY}/issues/{number}",
         }
 
     def call(self, path):
@@ -156,22 +215,17 @@ class MemoryGitHub:
     def pages(self, path):
         if path.startswith("milestones"):
             return copy.deepcopy(self.milestones)
-        if path.endswith("/comments"):
+        if path.endswith("/comments") and path.startswith("issues/"):
             number = int(path.split("/")[1])
             return copy.deepcopy([c for c in self.comments if c["issue"] == number])
-        if path == "issues?state=all&labels=bug":
+        if path.endswith("/events"):
+            return copy.deepcopy(self.events.get(int(path.split("/")[1]), []))
+        if path.startswith("pulls/"):
+            _, number, kind = path.split("/")
             return copy.deepcopy(
-                [i for i in self.items.values() if {"name": "bug"} in i["labels"]]
-            )
-        if path.startswith("issues?state=all&milestone="):
-            target = int(path.split("milestone=")[1].split("&")[0])
-            return copy.deepcopy(
-                [
-                    i
-                    for i in self.items.values()
-                    if (i.get("milestone") or {}).get("number") == target
-                    and {"name": "bug"} in i["labels"]
-                ]
+                (self.reviews if kind == "reviews" else self.inline).get(
+                    int(number), []
+                )
             )
         if path.endswith("/sub_issues"):
             number = int(path.split("/")[1])
@@ -183,17 +237,32 @@ class MemoryGitHub:
                 ]
             )
         if path == "pulls?state=all":
-            return []
+            return copy.deepcopy(list(self.prs.values()))
         if path.startswith("issues?"):
-            return copy.deepcopy(list(self.items.values()))
+            values = [i for i in self.items.values() if "pull_request" not in i]
+            if "labels=" in path:
+                label = path.split("labels=")[1].split("&")[0]
+                values = [i for i in values if {"name": label} in i["labels"]]
+            if "milestone=" in path:
+                target = int(path.split("milestone=")[1].split("&")[0])
+                values = [
+                    i for i in values if (i["milestone"] or {}).get("number") == target
+                ]
+            return copy.deepcopy(values)
         raise AssertionError(path)
 
     def rest(self, path, method="GET", data=None):
         if path == "":
             return {"default_branch": "main"}
-        if path == "commits/main":
+        if path.startswith("commits/"):
             return {"sha": "a" * 40}
+        if path.startswith("collaborators/"):
+            return {"permission": "write"}
         parts = path.split("/")
+        if parts[0] == "milestones" and len(parts) == 2 and method == "PATCH":
+            item = next(m for m in self.milestones if m["number"] == int(parts[1]))
+            item.update(data)
+            return copy.deepcopy(item)
         if path == "milestones" and method == "POST":
             item = dict(
                 data,
@@ -217,6 +286,8 @@ class MemoryGitHub:
             comment.update(data)
             return copy.deepcopy(comment)
         if parts[0] == "issues" and len(parts) == 2:
+            if int(parts[1]) not in self.items:
+                raise OperationError("HTTP 404")
             item = self.items[int(parts[1])]
             if method == "PATCH":
                 for key, value in data.items():
@@ -224,6 +295,8 @@ class MemoryGitHub:
                         item[key] = next(
                             (m for m in self.milestones if m["number"] == value), None
                         )
+                        if int(parts[1]) in self.prs:
+                            self.prs[int(parts[1])][key] = item[key]
                     elif key == "assignees":
                         item[key] = [{"login": x} for x in value]
                     else:
@@ -233,7 +306,7 @@ class MemoryGitHub:
             comment = dict(
                 data,
                 issue=int(parts[1]),
-                id=len(self.comments) + 1,
+                id=max([c["id"] for c in self.comments] + [0]) + 1,
                 user={"login": "github-actions[bot]", "type": "Bot"},
             )
             self.comments.append(comment)
@@ -249,165 +322,324 @@ class MemoryGitHub:
             )
             self.parents[child["number"]] = int(parts[1])
             return copy.deepcopy(child)
+        if parts[-1] == "labels" and method == "POST":
+            self.items[int(parts[1])]["labels"] += [
+                {"name": label} for label in data["labels"]
+            ]
+            return []
         raise AssertionError((path, method, data))
+
+    def graphql(self, query, **variables):
+        if query.startswith("query"):
+            values = self.projects.get(variables["id"], {})
+            return {
+                "node": {
+                    "projectItems": {
+                        "nodes": [
+                            {"id": item, "project": {"id": p}}
+                            for p, item in values.items()
+                        ],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    }
+                }
+            }
+        if "addProjectV2ItemById" in query:
+            values = self.projects.setdefault(variables["content"], {})
+            item = values.setdefault(
+                variables["project"], variables["content"] + "_" + variables["project"]
+            )
+            return {"addProjectV2ItemById": {"item": {"id": item}}}
+        if "deleteProjectV2Item" in query:
+            for values in self.projects.values():
+                if values.get(variables["project"]) == variables["item"]:
+                    del values[variables["project"]]
+            return {"deleteProjectV2Item": {"deletedItemId": variables["item"]}}
+        if "updateProjectV2ItemFieldValue" in query:
+            return {}
+        raise AssertionError(query)
+
+    def add_pr(self, number, body):
+        item = self.make_issue(number, "Implementation", body, [])
+        item["pull_request"] = {}
+        self.items[number] = item
+        pr = dict(
+            item,
+            html_url=f"https://github.com/{REPOSITORY}/pull/{number}",
+            merged_at=None,
+            draft=False,
+        )
+        self.prs[number] = pr
+        return pr
+
+    def comment(self, number, body):
+        item = {
+            "issue": number,
+            "id": max([c["id"] for c in self.comments] + [0]) + 1,
+            "body": body,
+            "user": {"login": "developer", "type": "User"},
+            "html_url": "https://example.com/comment",
+        }
+        self.comments.append(item)
+        return item
 
 
 class RepositoryOperations(unittest.TestCase):
     def setUp(self):
         self.api = MemoryGitHub()
-        self.controller = Controller(self.api, {"repository": REPOSITORY})
-        self.controller.reconcile = lambda *args, **kwargs: None
+        self.controller = Controller(
+            self.api,
+            {
+                "repository": REPOSITORY,
+                "projects": {
+                    "Bugfix": {
+                        "id": "P_BUG",
+                        "fields": {
+                            "Status": {
+                                "id": "STATUS",
+                                "options": [
+                                    {"name": n, "id": n}
+                                    for n in [
+                                        "Ready",
+                                        "In progress",
+                                        "In review",
+                                        "Done",
+                                    ]
+                                ],
+                            }
+                        },
+                    }
+                },
+            },
+        )
 
-    def test_preview_then_apply_reuses_the_same_result_comment(self):
-        self.controller.initialize_or_update(1, "release_init", dry_run=True)
-        comment_id = self.api.comments[0]["id"]
+    def initialize(self):
+        self.controller.initialize_or_update(1, "release_init")
+        return self.controller.load(1)[1]
+
+    def test_preview_then_apply_replaces_result_and_creates_flat_requirements(self):
+        self.controller.initialize_or_update(1, "release_init", True)
         self.assertEqual(len(self.api.items), 1)
         self.assertFalse(self.api.milestones)
-        self.assertEqual(self.api.items[1]["body"], PLAN)
-        self.controller.initialize_or_update(1, "release_init")
+        cid = self.api.comments[0]["id"]
+        state = self.initialize()
         self.assertEqual(len(self.api.comments), 1)
-        self.assertEqual(self.api.comments[0]["id"], comment_id)
+        self.assertEqual(self.api.comments[0]["id"], cid)
         self.assertNotIn("预览", self.api.comments[0]["body"])
-        _, state = self.controller.load(1)
-        self.assertEqual(
-            self.api.parents[state["scope"]["contract"]["number"]],
-            state["scope"]["connector"]["number"],
-        )
-        self.assertEqual(self.api.parents[state["archive"]], 1)
+        self.assertEqual(self.api.parents, {state["archive"]: 1})
+        self.assertEqual(set(state["scope"]), {"issue-3", "issue-4"})
+        self.assertIn("Acceptance criteria:", self.api.items[3]["body"])
         self.assertEqual(len(self.api.items), 4)
+        self.controller.initialize_or_update(1, "update")
+        self.assertEqual(self.controller.load(1)[1]["revision"], 1)
 
-    def test_bug_enters_verification_after_fix_merge(self):
-        self.assertEqual(
-            bug_progress(False, {}, {"9"}, True), ("status:verification", "In review")
-        )
-
-    def test_failed_verification_waits_for_a_new_fix(self):
-        record = {"result": "Failed", "merged_prs": ["9"]}
-        self.assertEqual(
-            bug_progress(False, record, {"9"}, True), ("status:fixing", "In progress")
-        )
-        self.assertEqual(
-            bug_progress(False, record, {"9", "12"}, True),
-            ("status:verification", "In review"),
-        )
-
-    def test_verified_bug_is_done_and_reopened_bug_returns_to_fixing(self):
-        record = {"result": "Passed", "merged_prs": ["9"]}
-        self.assertEqual(
-            bug_progress(True, record, {"9"}, True), ("status:verified", "Done")
-        )
-        self.assertEqual(
-            bug_progress(False, record, {"9"}, True), ("status:fixing", "In progress")
-        )
-
-    def test_retry_recovers_issue_created_before_lost_response(self):
-        self.api.lose_response_for = "Connector v2 接口契约"
+    def test_recovery_after_lost_create_response(self):
+        self.api.lose_response_for = "Store interface"
         with self.assertRaises(OperationError):
-            self.controller.initialize_or_update(1, "release_init")
-        self.controller.initialize_or_update(1, "release_init")
+            self.initialize()
+        self.initialize()
         self.assertEqual(len(self.api.items), 4)
         self.assertEqual(len(self.api.milestones), 1)
-        self.controller.initialize_or_update(1, "release_init")
-        self.assertEqual(len(self.api.items), 4)
 
-    def test_update_removes_delivery_scope_and_keeps_parent_and_issue(self):
-        self.controller.initialize_or_update(1, "release_init")
-        _, before = self.controller.load(1)
-        parent = before["scope"]["connector"]["number"]
-        child = before["scope"]["contract"]["number"]
+    def test_remove_retains_issue_and_manual_milestone(self):
+        self.initialize()
+        self.api.items[4]["milestone"] = {"number": 22, "title": "0.13.0"}
+        body = self.api.items[1]["body"]
         self.api.items[1]["body"] = (
-            self.api.items[1]["body"].split("#### 子需求")[0]
-            + "\n## 变更记录\n变更说明：子需求延期\n"
+            body[: body.index("- Store interface")]
+            + "### Change Log\n\nreason: Deferred.\n"
         )
         self.controller.initialize_or_update(1, "update")
-        _, after = self.controller.load(1)
-        self.assertEqual(set(after["scope"]), {"connector"})
-        self.assertIsNone(self.api.items[child]["milestone"])
-        self.assertEqual(self.api.parents[child], parent)
-        self.assertEqual(self.api.items[child]["state"], "open")
-        self.controller.initialize_or_update(1, "update")
-        self.assertEqual(len(self.api.items), 4)
+        self.assertEqual(set(self.controller.load(1)[1]["scope"]), {"issue-3"})
+        self.assertEqual(self.api.items[4]["milestone"]["number"], 22)
 
-    def test_update_retains_manually_retargeted_removed_item(self):
-        self.controller.initialize_or_update(1, "release_init")
-        _, before = self.controller.load(1)
-        child = before["scope"]["contract"]["number"]
-        self.api.items[child]["milestone"] = {"number": 2, "title": "0.12.0"}
+    def test_remove_clears_owned_milestone_and_retains_native_parent(self):
+        self.initialize()
+        self.api.parents[4] = 3
+        body = self.api.items[1]["body"]
         self.api.items[1]["body"] = (
-            self.api.items[1]["body"].split("#### 子需求")[0]
-            + "\n变更说明：延期至 0.12.0\n"
+            body[: body.index("- Store interface")]
+            + "### Change Log\n\nreason: Deferred.\n"
         )
         self.controller.initialize_or_update(1, "update")
-        self.assertEqual(self.api.items[child]["milestone"]["number"], 2)
+        self.assertIsNone(self.api.items[4]["milestone"])
+        self.assertEqual(self.api.parents[4], 3)
+        self.assertEqual(self.api.items[4]["state"], "open")
 
-    def test_later_command_recovers_cancelled_earlier_command_in_order(self):
-        self.controller.authorize = lambda actor: None
-        user = {"login": "maintainer", "type": "User"}
-        preview = {
-            "id": 10,
-            "issue": 1,
-            "user": user,
-            "body": "/release_init --dry-run",
-        }
-        apply = {"id": 11, "issue": 1, "user": user, "body": "/release_init"}
-        self.api.comments.extend([preview, apply])
-        self.controller.handle(
-            {"issue": {"number": 1}, "comment": apply, "sender": user}, "issue_comment"
-        )
-        _, state = self.controller.load(1)
-        self.assertTrue(state["initialized"])
-        self.assertEqual(state["processed_comments"], ["10", "11"])
-        self.assertEqual(state["command_cursor"], 11)
-        self.controller.drain_commands(1)
-        self.assertEqual(len(self.api.items), 4)
-
-    def test_unassigned_bug_template_does_not_block_version_reconciliation(self):
-        self.controller.initialize_or_update(1, "release_init")
-        self.api.items[99] = self.api.make_issue(
-            99, "Unassigned Bug", "源版本主 Bug Issue：#", ["bug"]
-        )
-        Controller.reconcile(self.controller, 1)
-        comment, state = self.controller.load(1)
-        self.assertIn("待归档", comment["body"])
-        self.assertTrue(state["initialized"])
-
-    def test_readiness_error_is_written_back_to_the_result_comment(self):
-        self.controller.authorize = lambda actor: None
-
-        def fail(release):
-            raise OperationError("receipt lookup failed")
-
-        self.controller.readiness = fail
-        user = {"login": "maintainer", "type": "User"}
-        command = {"id": 20, "issue": 1, "user": user, "body": "/release_ready"}
+    def test_invalid_plan_creates_no_repository_objects(self):
+        self.api.items[1]["body"] = PLAN.replace("  description:", " description:", 1)
         with self.assertRaises(OperationError):
-            self.controller.handle(
-                {"issue": {"number": 1}, "comment": command, "sender": user},
-                "issue_comment",
-            )
-        comment, _ = self.controller.load(1)
-        self.assertIn("执行失败", comment["body"])
-        self.assertIn("receipt lookup failed", comment["body"])
+            self.initialize()
+        self.assertEqual(len(self.api.items), 1)
+        self.assertFalse(self.api.milestones)
 
-    def test_changed_code_requires_current_candidate_verification(self):
-        self.controller.initialize_or_update(1, "release_init")
-        _, state = self.controller.load(1)
+    def test_metadata_update_sets_manager_and_milestone_date(self):
+        self.initialize()
+        self.api.items[1]["body"] = self.api.items[1]["body"].replace(
+            "release_date: TBD", "release_date: 2026-12-01"
+        )
+        self.controller.initialize_or_update(1, "update")
+        self.assertEqual(self.api.milestones[0]["due_on"], "2026-12-01T23:59:59Z")
+        self.assertEqual(self.api.items[1]["assignees"], [{"login": "harrisonyhq"}])
+        self.assertEqual(self.controller.load(1)[1]["revision"], 2)
+
+    def test_existing_issue_description_is_preserved_and_assignee_can_clear(self):
+        self.initialize()
+        self.api.items[3]["body"] += "\nManual implementation notes."
+        self.api.items[1]["body"] = self.api.items[1]["body"].replace(
+            "assignee: @harrisonyhq", "assignee:"
+        )
+        self.controller.initialize_or_update(1, "update")
+        self.assertIn("Manual implementation notes.", self.api.items[3]["body"])
+        self.assertEqual(self.api.items[3]["assignees"], [])
+
+    def test_pending_commands_are_replayed_in_order(self):
+        preview = self.api.comment(1, "/release_init --dry-run")
+        apply = self.api.comment(1, "/release_init")
+        self.controller.handle(
+            {"issue": {"number": 1}, "comment": apply, "sender": apply["user"]},
+            "issue_comment",
+        )
+        state = self.controller.load(1)[1]
+        self.assertTrue(state["initialized"])
+        self.assertEqual(
+            state["processed_comments"], [str(preview["id"]), str(apply["id"])]
+        )
+
+    def test_body_comment_review_and_inline_form_one_reference_set(self):
+        self.initialize()
+        self.api.projects["I_3"] = {"P_CONNECTOR": "M_REQ"}
+        self.api.projects["I_4"] = {"P_STORE": "M_REQ2"}
+        self.api.add_pr(10, "Implements #3")
+        comment = self.api.comment(10, "Also #4")
+        self.api.reviews[10] = [{"body": "Related #3", "user": {"type": "User"}}]
+        self.api.inline[10] = [{"body": "Implements #4", "user": {"type": "User"}}]
+        self.controller.reconcile(1)
+        state = self.controller.load(1)[1]
+        self.assertEqual(set(state["prs"]["10"]["requirements"]), {3, 4})
+        self.assertEqual(self.api.prs[10]["milestone"]["number"], 1)
+        self.assertEqual(set(self.api.projects["I_10"]), {"P_CONNECTOR", "P_STORE"})
+        self.assertEqual(self.api.items[1]["body"].count("/pull/10)"), 2)
+        self.api.prs[10]["body"] = ""
+        self.api.comments.remove(comment)
+        self.controller.reconcile(1)
+        self.assertEqual(
+            set(self.controller.load(1)[1]["prs"]["10"]["requirements"]), {3, 4}
+        )
+        self.api.reviews[10] = []
+        self.api.inline[10] = []
+        self.controller.reconcile(1)
+        self.assertIsNone(self.api.prs[10]["milestone"])
+        self.assertFalse(self.api.projects["I_10"])
+        self.assertNotIn("/pull/10)", self.api.items[1]["body"])
+        self.assertEqual(self.controller.load(1)[1]["revision"], 1)
+
+    def test_pr_comment_event_triggers_reconciliation_without_a_command(self):
+        self.initialize()
+        self.api.add_pr(10, "")
+        comment = self.api.comment(10, "Implements #3")
+        self.controller.handle(
+            {"issue": {"number": 10, "pull_request": {}}, "comment": comment},
+            "issue_comment",
+        )
+        self.assertEqual(self.api.prs[10]["milestone"]["number"], 1)
+
+    def test_bot_receipts_are_excluded_from_mentions(self):
+        self.initialize()
+        self.api.add_pr(10, "")
+        comment = self.api.comment(10, "Related #3")
+        comment["user"]["type"] = "Bot"
+        self.controller.reconcile(1)
+        self.assertIsNone(self.api.prs[10]["milestone"])
+
+    def test_pr_state_change_refreshes_display_without_scope_revision(self):
+        self.initialize()
+        pr = self.api.add_pr(10, "#3")
+        self.controller.reconcile(1)
+        pr["merged_at"] = "2026-11-18T00:00:00Z"
+        pr["state"] = "closed"
+        self.controller.reconcile(1)
+        self.assertIn("| merged", self.api.items[1]["body"])
+        self.assertEqual(self.controller.load(1)[1]["revision"], 1)
+
+    def test_conflicting_versions_and_manual_metadata_are_preserved(self):
+        self.initialize()
+        self.api.items[4]["milestone"] = {"number": 2, "title": "0.13.0"}
+        self.api.projects["I_3"] = {"P_REQ": "REQ"}
+        self.api.add_pr(10, "#3 #4")
+        self.api.projects["I_10"] = {"P_MANUAL": "MANUAL"}
+        self.controller.reconcile(1)
+        self.assertIsNone(self.api.prs[10]["milestone"])
+        self.assertIn("conflicting", self.controller.load(1)[0]["body"])
+        self.assertEqual(set(self.api.projects["I_10"]), {"P_REQ", "P_MANUAL"})
+        self.api.prs[10]["body"] = ""
+        self.controller.reconcile(1)
+        self.assertEqual(self.api.projects["I_10"], {"P_MANUAL": "MANUAL"})
+
+    def test_manual_milestone_clear_and_project_remove_persist(self):
+        self.initialize()
+        self.api.projects["I_3"] = {"P_REQ": "REQ"}
+        self.api.add_pr(10, "#3")
+        self.controller.reconcile(1)
+        self.api.prs[10]["milestone"] = None
+        self.api.projects["I_10"].clear()
+        self.controller.reconcile(1)
+        self.assertIsNone(self.api.prs[10]["milestone"])
+        self.assertFalse(self.api.projects["I_10"])
+        self.assertEqual(self.controller.load(1)[1]["prs"]["10"]["mode"], "manual")
+
+    def test_bugfix_mention_uses_target_version_and_bugfix_project(self):
+        state = self.initialize()
+        bug = self.api.make_issue(8, "Bug", "", ["bug"])
+        bug["milestone"] = {"number": 2, "title": "0.13.0"}
+        self.api.items[8] = bug
+        self.api.parents[8] = state["archive"]
+        self.api.add_pr(10, "Fixes #8")
+        self.controller.reconcile(1)
+        self.assertIn("P_BUG", self.api.projects["I_10"])
+        self.assertEqual(self.controller.load(1)[1]["prs"]["10"]["last"], 2)
+        self.assertEqual(self.api.parents[8], state["archive"])
+
+    def test_changed_code_requires_current_verification(self):
+        state = self.initialize()
         for entry in state["scope"].values():
             self.api.items[entry["number"]]["state"] = "closed"
         state["verification"] = {
             str(e["number"]): {
                 "result": "Passed",
-                "milestone": state["milestone"]["number"],
+                "milestone": 1,
                 "tested_commit": "old",
             }
             for e in state["scope"].values()
         }
-        self.controller.save(1, state, "Previous candidate accepted")
+        self.controller.save(1, state, "Previous candidate")
         self.assertEqual(self.controller.readiness(1)[1]["status"], "blocked")
         for record in state["verification"].values():
             record["tested_commit"] = "a" * 40
-        self.controller.save(1, state, "Current candidate accepted")
+        self.controller.save(1, state, "Current candidate")
         self.assertEqual(self.controller.readiness(1)[1]["status"], "ready")
+
+    def test_unassigned_bug_does_not_block_other_versions(self):
+        self.initialize()
+        self.api.items[99] = self.api.make_issue(
+            99, "Unassigned", "source_bug_archive: #", ["bug"]
+        )
+        self.controller.reconcile(1)
+        self.assertIn("待归档", self.controller.load(1)[0]["body"])
+
+    def test_manual_milestone_ownership_and_bug_status(self):
+        self.assertEqual(
+            manual_mode({"mode": "auto", "last": 1}, None)["mode"], "manual"
+        )
+        self.assertEqual(
+            manual_mode({"mode": "auto", "last": 1}, 1, True)["mode"], "manual"
+        )
+        self.assertEqual(
+            bug_progress(False, {}, {"9"}, True), ("status:verification", "In review")
+        )
+        record = {"result": "Failed", "merged_prs": ["9"]}
+        self.assertEqual(
+            bug_progress(False, record, {"9"}, True), ("status:fixing", "In progress")
+        )
 
 
 if __name__ == "__main__":
