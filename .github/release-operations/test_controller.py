@@ -185,6 +185,10 @@ class ParserContracts(unittest.TestCase):
                 PLAN.replace("release_date: TBD", "release_date: tomorrow"), REPOSITORY
             )
 
+    def test_pr_template_has_no_placeholder_issue_mentions(self):
+        body = (Path(__file__).parent.parent / "PULL_REQUEST_TEMPLATE.md").read_text()
+        self.assertFalse(references(body, REPOSITORY))
+
 
 class MemoryGitHub:
     def __init__(self):
@@ -193,6 +197,8 @@ class MemoryGitHub:
         self.prs, self.reviews, self.inline, self.events = {}, {}, {}, {}
         self.projects = {}
         self.lose_response_for = None
+        self.lose_milestone_response = False
+        self.lose_project_response = False
 
     @staticmethod
     def make_issue(number, title, body, labels):
@@ -297,6 +303,11 @@ class MemoryGitHub:
                         )
                         if int(parts[1]) in self.prs:
                             self.prs[int(parts[1])][key] = item[key]
+                            if self.lose_milestone_response:
+                                self.lose_milestone_response = False
+                                raise OperationError(
+                                    "Milestone response lost after acceptance"
+                                )
                     elif key == "assignees":
                         item[key] = [{"login": x} for x in value]
                     else:
@@ -348,6 +359,9 @@ class MemoryGitHub:
             item = values.setdefault(
                 variables["project"], variables["content"] + "_" + variables["project"]
             )
+            if self.lose_project_response:
+                self.lose_project_response = False
+                raise OperationError("Project response lost after acceptance")
             return {"addProjectV2ItemById": {"item": {"id": item}}}
         if "deleteProjectV2Item" in query:
             for values in self.projects.values():
@@ -586,6 +600,30 @@ class RepositoryOperations(unittest.TestCase):
         self.assertIsNone(self.api.prs[10]["milestone"])
         self.assertFalse(self.api.projects["I_10"])
         self.assertEqual(self.controller.load(1)[1]["prs"]["10"]["mode"], "manual")
+
+    def test_lost_milestone_response_recovers_automatic_ownership(self):
+        self.initialize()
+        self.api.add_pr(10, "#3")
+        self.api.lose_milestone_response = True
+        with self.assertRaises(OperationError):
+            self.controller.reconcile(1)
+        self.controller.reconcile(1)
+        self.assertEqual(self.controller.load(1)[1]["prs"]["10"]["mode"], "auto")
+        self.assertEqual(self.api.prs[10]["milestone"]["number"], 1)
+
+    def test_lost_project_response_recovers_item_identity(self):
+        self.initialize()
+        self.api.projects["I_3"] = {"P_REQ": "REQ"}
+        self.api.add_pr(10, "#3")
+        self.api.lose_project_response = True
+        with self.assertRaises(OperationError):
+            self.controller.reconcile(1)
+        self.controller.reconcile(1)
+        record = self.controller.load(1)[1]["prs"]["10"]["projects"]["P_REQ"]
+        self.assertEqual(record["item"], self.api.projects["I_10"]["P_REQ"])
+        self.api.projects["I_10"].clear()
+        self.controller.reconcile(1)
+        self.assertFalse(self.api.projects["I_10"])
 
     def test_bugfix_mention_uses_target_version_and_bugfix_project(self):
         state = self.initialize()
