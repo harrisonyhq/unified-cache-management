@@ -91,13 +91,36 @@ class ParserContracts(unittest.TestCase):
         entries = parse_release(PLAN, REPOSITORY)["entries"]
         mappings = {e["key"]: n for e, n in zip(entries, [14, 13])}
         patched = patch_references(PLAN, mappings, REPOSITORY)
-        self.assertIn("/issues/14]", patched)
+        self.assertIn("initial integration [#14]", patched)
         self.assertEqual(patch_references(patched, mappings, REPOSITORY), patched)
         actual = parse_release(patched, REPOSITORY)["entries"]
         self.assertEqual([e["key"] for e in actual], ["issue-14", "issue-13"])
         self.assertEqual(actual[0]["description"], entries[0]["description"])
         previous = {e["key"]: e for e in bind_entries(entries, mappings)}
         self.assertFalse(any(scope_diff(previous, actual).values()))
+
+    def test_full_issue_url_normalizes_only_the_title_reference(self):
+        url = f"https://github.com/{REPOSITORY}/issues/14"
+        body = PLAN.replace("initial integration []", f"initial integration [{url}]")
+        body = body.replace("Implement the connector.", f"See [{url}].")
+        before = parse_release(body, REPOSITORY)["entries"]
+        patched = patch_references(body, {}, REPOSITORY)
+        self.assertIn("initial integration [#14]", patched)
+        self.assertIn(f"See [{url}].", patched)
+        self.assertEqual(parse_release(patched, REPOSITORY)["entries"], before)
+        self.assertEqual(patch_references(patched, {}, REPOSITORY), patched)
+
+    def test_pr_refresh_normalizes_legacy_full_url_without_scope_changes(self):
+        body = PLAN.replace(
+            "initial integration []",
+            f"initial integration [https://github.com/{REPOSITORY}/issues/14]",
+        )
+        patched = patch_pull_requests(body, {}, REPOSITORY)
+        self.assertIn("initial integration [#14]", patched)
+        self.assertEqual(
+            parse_release(body, REPOSITORY)["entries"],
+            parse_release(patched, REPOSITORY)["entries"],
+        )
 
     def test_existing_references_and_issue15_regression(self):
         body = PLAN.replace(

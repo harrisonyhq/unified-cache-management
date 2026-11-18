@@ -29,7 +29,9 @@ and nested lists.
 ```
 
 A final `[]` creates an Issue; `[#123]` or `[https://github.com/OWNER/REPO/issues/123]`
-reuses a local Issue. New Issue links replace the empty brackets. Issue IDs identify
+reuses a local Issue. Writeback uses `[#123]` for both newly created and existing
+Issues so GitHub renders native references cleanly. Full URLs remain valid input.
+Issue IDs identify
 synchronized scope. Creation-origin markers recover accepted requests after lost
 responses. Requirement parent relationships are managed by developers in GitHub.
 The controller retains historical snapshots and existing parent relationships.
