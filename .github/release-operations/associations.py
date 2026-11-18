@@ -65,6 +65,8 @@ class PullRequestAssociations:
                 and project not in current
             ):
                 existing["mode"] = "manual_removed"
+            if existing["mode"] == "auto" and project in current:
+                existing["item"] = current[project]
             if existing["mode"] == "auto" and project not in current:
                 # Save ownership before an API request whose response can be lost.
                 self.save(release, state, f"Synchronizing PR #{pr['number']} Projects")
@@ -126,6 +128,10 @@ class PullRequestAssociations:
             record = state["prs"].setdefault(
                 key, {"mode": "auto" if current is None else "manual", "last": current}
             )
+            if "pending_milestone" in record:
+                pending = record.pop("pending_milestone")
+                if current == pending:
+                    record["last"] = current
             record = manual_mode(record, current)
             record = self.milestone_history(pr["number"], record)
             record.update(
@@ -145,7 +151,10 @@ class PullRequestAssociations:
             elif record["mode"] == "auto":
                 desired = next(iter(targets), None)
                 if current != desired:
+                    record["pending_milestone"] = desired
+                    self.save(release, state, f"Synchronizing PR #{key} Milestone")
                     self.api.rest(f"issues/{key}", "PATCH", {"milestone": desired})
+                    record.pop("pending_milestone", None)
                 record["last"] = desired
             record["target_title"] = next(
                 (

@@ -8,7 +8,7 @@ BEFORE SUBMITTING, PLEASE READ OUR OFFICIAL WEBSITE.
 
 What this PR does / why we need it?
 
-Reference related requirement or bug Issues using #123 or a full Issue URL.
+Reference related requirement or bug Issues by number or full Issue URL.
 References in the PR description, conversation, and reviews drive release associations.
 <!--
 - Please clarify what changes you are proposing. The purpose of this section is to outline the changes and how this PR fixes the issue.
