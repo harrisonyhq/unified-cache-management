@@ -9,6 +9,10 @@ REF_RE = re.compile(
     r"(?<![\w/])(?:https://github\.com/([\w.-]+/[\w.-]+)/issues/|"
     r"(?:([\w.-]+/[\w.-]+))?#)(\d+)\b"
 )
+MARKDOWN_LINK_RE = re.compile(r"\[(?P<label>(?:\\.|[^\]\\])*)\]\((?P<url>[^\s()]*)\)$")
+ISSUE_URL_RE = re.compile(
+    r"https://github\.com/[\w.-]+/[\w.-]+/issues/[1-9]\d*(?:[?#][^\s]*)?\Z"
+)
 
 
 class OperationError(ValueError):
@@ -25,6 +29,9 @@ def field(body, name):
 
 
 def issue_reference(value, repository):
+    link = MARKDOWN_LINK_RE.fullmatch(value.strip())
+    if link:
+        value = link["url"]
     matches = list(REF_RE.finditer(value))
     if len(matches) != 1:
         raise OperationError("Expected one Issue reference: " + value)
@@ -32,7 +39,10 @@ def issue_reference(value, repository):
     target = match[1] or match[2] or repository
     if target.lower() != repository.lower():
         raise OperationError("Cross-repository Issue reference: " + target)
-    return int(match[3])
+    number = int(match[3])
+    if number <= 0:
+        raise OperationError("Issue numbers must be positive")
+    return number
 
 
 def references(text, repository):
@@ -41,7 +51,7 @@ def references(text, repository):
     text = re.sub(
         r"\[[^\]]*\]\((https?://[^)]+)\)",
         lambda m: (
-            m[0]
+            m[1]
             if re.match(r"https://github\.com/[^/]+/[^/]+/issues/\d+", m[1])
             else " "
         ),
@@ -52,6 +62,47 @@ def references(text, repository):
         for m in REF_RE.finditer(text)
         if (m[1] or m[2] or repository).lower() == repository.lower()
     }
+
+
+def split_requirement_reference(value, repository):
+    """Split a trailing reference; the URL is authoritative for Markdown links."""
+    match = MARKDOWN_LINK_RE.search(value)
+    if match:
+        prefix = value[: match.start()].rstrip()
+        label, url = match["label"], match["url"]
+        if url and not ISSUE_URL_RE.fullmatch(url):
+            raise OperationError(
+                "Use a complete GitHub Issue URL as the link destination"
+            )
+        number = issue_reference(url, repository) if url else None
+        return prefix, number, label if url or not prefix else None, match.start()
+    match = re.search(r"\[([^\[\]]*)\]$", value)
+    if match:
+        reference = match[1].strip()
+        if reference and not (
+            re.fullmatch(r"#\d+", reference) or ISSUE_URL_RE.fullmatch(reference)
+        ):
+            raise OperationError("Use [text](Issue URL), [](), or []")
+        return (
+            value[: match.start()].rstrip(),
+            issue_reference(reference, repository) if reference else None,
+            None,
+            match.start(),
+        )
+    match = re.search(r"(?<!\S)(https://\S+|(?:[\w.-]+/[\w.-]+)?#\d+)$", value)
+    if match:
+        reference = match[1]
+        if reference.startswith("https://") and not ISSUE_URL_RE.fullmatch(reference):
+            raise OperationError("Use a complete GitHub Issue URL")
+        return (
+            value[: match.start()].rstrip(),
+            issue_reference(reference, repository),
+            None,
+            match.start(),
+        )
+    raise OperationError(
+        "End the title with [text](Issue URL) or [Issue]() for a new Issue"
+    )
 
 
 def sections(body):
@@ -171,17 +222,15 @@ def parse_release(body, repository):
                     fail("title continuation must use two spaces", i)
                 title_lines.append(lines[i].strip())
         title = " ".join(title_lines).strip()
-        match = re.fullmatch(r"(.+?)\s+\[([^\[\]]*)\]", title)
-        if not match:
-            fail("end the title with [] or [Issue reference]")
-        title, reference = match[1].strip(), match[2].strip()
+        try:
+            prefix, number, label, _ = split_requirement_reference(title, repository)
+        except OperationError as error:
+            fail(str(error))
+        title = prefix or re.sub(r"\\([\\\[\]()])", r"\1", label or "")
+        if not title:
+            fail("provide a requirement title")
         if len(title) > 256:
             fail("title exceeds 256 characters")
-        number = issue_reference(reference, repository) if reference else None
-        if reference and not re.fullmatch(
-            r"(?:#\d+|https://github\.com/[\w.-]+/[\w.-]+/issues/\d+)", reference
-        ):
-            fail("use #123 or a complete Issue URL inside brackets")
         for a, b in ((desc + 1, owner), (prs + 1, last)):
             for i in range(a, b):
                 if lines[i].strip() and not lines[i].startswith("    "):
@@ -257,16 +306,23 @@ def patch_references(body, mappings, repository):
         if not number:
             continue
         title_end = next(i for i in range(start, end) if lines[i] == "  description:")
-        for i in reversed(range(start, title_end)):
-            if not lines[i].strip():
-                continue
-            if re.search(r"\[[^\[\]]*\][ \t]*$", lines[i]):
-                lines[i] = re.sub(
-                    r"\[[^\[\]]*\][ \t]*$",
-                    f"[#{number}]",
-                    lines[i],
-                )
-            break
+        parts = [
+            (i, lines[i][2:].strip())
+            for i in range(start, title_end)
+            if lines[i].strip()
+        ]
+        _, _, label, offset = split_requirement_reference(
+            " ".join(text for _, text in parts), repository
+        )
+        link = f"[{label or '#' + str(number)}](https://github.com/{repository}/issues/{number})"
+        cursor = 0
+        for position, (i, text) in enumerate(parts):
+            if offset < cursor + len(text):
+                lines[i] = lines[i][:2] + text[: offset - cursor] + link
+                for remaining, _ in parts[position + 1 :]:
+                    lines[remaining] = ""
+                break
+            cursor += len(text) + 1
     return "\n".join(lines) + ("\n" if body.endswith("\n") else "")
 
 

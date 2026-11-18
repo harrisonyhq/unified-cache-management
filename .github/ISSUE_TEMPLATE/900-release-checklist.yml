@@ -21,10 +21,10 @@ body:
     id: requirements
     attributes:
       label: Requirements
-      description: Use two spaces for title continuations and fields, and four spaces for description content. Leave [] empty to create an Issue. The workflow maintains pull_requests.
+      description: Use two spaces for title continuations and fields, and four spaces for description content. Use [Issue]() to create an Issue, or [text](Issue URL) to reuse an Issue. The workflow maintains pull_requests.
       value: |
         - MiniMax M3.1 support
-          with vLLM-Ascend v0.32.0 []
+          with vLLM-Ascend v0.32.0 [Issue]()
 
           description:
             Integrate MiniMax M3.1 with vLLM-Ascend v0.32.0.
@@ -39,7 +39,7 @@ body:
           pull_requests:
 
         - Connector v2 integration
-          for the first release []
+          for the first release [Issue]()
 
           description:
             Complete the initial Connector v2 integration.

@@ -1,4 +1,5 @@
 import copy
+import re
 import unittest
 from pathlib import Path
 
@@ -138,6 +139,108 @@ class ParserContracts(unittest.TestCase):
         self.assertEqual(
             [e["number"] for e in parse_release(body, REPOSITORY)["entries"]], [14, 13]
         )
+
+    def test_common_pasted_formats_normalize_to_markdown_links(self):
+        url = f"https://github.com/{REPOSITORY}/issues/14"
+        expected = None
+        for ref in (
+            f"[Issue]({url})",
+            f"[#14]({url})",
+            f"[{url}]",
+            "[#14]",
+            url,
+            "#14",
+            f"{REPOSITORY}#14",
+            f"[Issue]({url}#issuecomment-123)",
+        ):
+            with self.subTest(reference=ref):
+                body = PLAN.replace(
+                    "initial integration []", "initial integration " + ref
+                )
+                entry = parse_release(body, REPOSITORY)["entries"][0]
+                expected = expected or entry
+                self.assertEqual(entry, expected)
+                patched = patch_references(body, {}, REPOSITORY)
+                self.assertRegex(
+                    patched,
+                    r"initial integration \[(?:Issue|#14)\]\(https://github.com/"
+                    + re.escape(REPOSITORY)
+                    + r"/issues/14\)",
+                )
+                self.assertEqual(patch_references(patched, {}, REPOSITORY), patched)
+                self.assertEqual(
+                    parse_release(patched, REPOSITORY)["entries"][0], entry
+                )
+
+    def test_whole_title_can_be_a_markdown_link(self):
+        url = f"https://github.com/{REPOSITORY}/issues/14"
+        body = PLAN.replace(
+            "- Connector v2\n  initial integration []",
+            f"- [Connector integration]({url})",
+        )
+        entry = parse_release(body, REPOSITORY)["entries"][0]
+        self.assertEqual(entry["title"], "Connector integration")
+        self.assertEqual(entry["number"], 14)
+        self.assertEqual(patch_references(body, {}, REPOSITORY), body)
+
+    def test_multiline_markdown_link_label_round_trips(self):
+        url = f"https://github.com/{REPOSITORY}/issues/14"
+        body = PLAN.replace(
+            "- Connector v2\n  initial integration []",
+            f"- [Connector v2\n  initial integration]({url})",
+        )
+        before = parse_release(body, REPOSITORY)["entries"]
+        patched = patch_references(body, {}, REPOSITORY)
+        self.assertIn(f"- [Connector v2 initial integration]({url})", patched)
+        self.assertEqual(before, parse_release(patched, REPOSITORY)["entries"])
+        self.assertEqual(patch_references(patched, {}, REPOSITORY), patched)
+
+    def test_new_requirement_uses_empty_markdown_destination(self):
+        body = PLAN.replace("initial integration []", "initial integration [Issue]()")
+        entry = parse_release(body, REPOSITORY)["entries"][0]
+        self.assertIsNone(entry["number"])
+        self.assertEqual(entry["title"], "Connector v2 initial integration")
+        patched = patch_references(body, {entry["key"]: 14}, REPOSITORY)
+        self.assertIn(
+            f"initial integration [#14](https://github.com/{REPOSITORY}/issues/14)",
+            patched,
+        )
+        self.assertFalse(
+            any(
+                scope_diff(
+                    {"issue-14": dict(entry, key="issue-14", number=14)},
+                    [parse_release(patched, REPOSITORY)["entries"][0]],
+                ).values()
+            )
+        )
+
+    def test_markdown_link_destination_controls_mentions(self):
+        self.assertEqual(
+            references(f"[#99](https://github.com/{REPOSITORY}/issues/14)", REPOSITORY),
+            {14},
+        )
+        self.assertEqual(
+            issue_reference(
+                f"[#99](https://github.com/{REPOSITORY}/issues/14)", REPOSITORY
+            ),
+            14,
+        )
+        with self.assertRaises(OperationError):
+            issue_reference("#0", REPOSITORY)
+
+    def test_invalid_markdown_destinations_are_rejected(self):
+        for ref in (
+            "[Issue](https://github.com/other/repo/issues/14)",
+            f"[Issue](https://github.com/{REPOSITORY}/pull/14)",
+            "[Issue](javascript:alert)",
+        ):
+            with self.subTest(reference=ref), self.assertRaises(OperationError):
+                parse_release(
+                    PLAN.replace(
+                        "initial integration []", "initial integration " + ref
+                    ),
+                    REPOSITORY,
+                )
 
     def test_invalid_input_reports_line_before_creation(self):
         for bad in [
@@ -461,6 +564,7 @@ class RepositoryOperations(unittest.TestCase):
         return self.controller.load(1)[1]
 
     def test_preview_then_apply_replaces_result_and_creates_flat_requirements(self):
+        self.api.items[1]["body"] = PLAN.replace("[]", "[Issue]()")
         self.controller.initialize_or_update(1, "release_init", True)
         self.assertEqual(len(self.api.items), 1)
         self.assertFalse(self.api.milestones)

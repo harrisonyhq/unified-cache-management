@@ -15,7 +15,7 @@ and nested lists.
 
 ```markdown
 - Connector v2
-  initial integration []
+  initial integration [Issue]()
 
   description:
     Implement the connector.
@@ -28,10 +28,12 @@ and nested lists.
   pull_requests:
 ```
 
-A final `[]` creates an Issue; `[#123]` or `[https://github.com/OWNER/REPO/issues/123]`
-reuses a local Issue. Writeback uses `[#123]` for both newly created and existing
-Issues so GitHub renders native references cleanly. Full URLs remain valid input.
-Issue IDs identify
+A final `[Issue]()` creates an Issue. Use `[text](https://github.com/OWNER/REPO/issues/123)`
+to reuse a local Issue; the URL determines identity and the label controls display.
+The whole requirement title can also be a Markdown link. Pasted bare Issue URLs,
+short references, and legacy bracketed references remain accepted input. Writeback
+normalizes existing references to `[text](URL)` and creates `[#123](URL)` for new
+Issues. Nonempty link labels are preserved. Issue IDs identify
 synchronized scope. Creation-origin markers recover accepted requests after lost
 responses. Requirement parent relationships are managed by developers in GitHub.
 The controller retains historical snapshots and existing parent relationships.
