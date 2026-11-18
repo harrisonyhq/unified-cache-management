@@ -9,7 +9,9 @@ REF_RE = re.compile(
     r"(?<![\w/])(?:https://github\.com/([\w.-]+/[\w.-]+)/issues/|"
     r"(?:([\w.-]+/[\w.-]+))?#)(\d+)\b"
 )
-MARKDOWN_LINK_RE = re.compile(r"\[(?P<label>(?:\\.|[^\]\\])*)\]\((?P<url>[^\s()]*)\)$")
+MARKDOWN_LINK_RE = re.compile(
+    r"\[(?P<label>(?:\\.|[^\]\\])*)\]\([ \t]*(?P<url>[^\s()]*?)[ \t]*\)$"
+)
 ISSUE_URL_RE = re.compile(
     r"https://github\.com/[\w.-]+/[\w.-]+/issues/[1-9]\d*(?:[?#][^\s]*)?\Z"
 )
@@ -70,9 +72,9 @@ def split_requirement_reference(value, repository):
     if match:
         prefix = value[: match.start()].rstrip()
         label, url = match["label"], match["url"]
-        if url and not ISSUE_URL_RE.fullmatch(url):
+        if url and not (ISSUE_URL_RE.fullmatch(url) or re.fullmatch(r"#\d+", url)):
             raise OperationError(
-                "Use a complete GitHub Issue URL as the link destination"
+                "Use a GitHub Issue URL or #number as the link destination"
             )
         number = issue_reference(url, repository) if url else None
         return prefix, number, label if url or not prefix else None, match.start()

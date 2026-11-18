@@ -152,6 +152,8 @@ class ParserContracts(unittest.TestCase):
             "#14",
             f"{REPOSITORY}#14",
             f"[Issue]({url}#issuecomment-123)",
+            "[Issue](#14 )",
+            f"[Issue]( {url} )",
         ):
             with self.subTest(reference=ref):
                 body = PLAN.replace(
@@ -182,6 +184,18 @@ class ParserContracts(unittest.TestCase):
         self.assertEqual(entry["title"], "Connector integration")
         self.assertEqual(entry["number"], 14)
         self.assertEqual(patch_references(body, {}, REPOSITORY), body)
+
+    def test_issue15_whole_title_and_short_destination(self):
+        body = PLAN.replace(
+            "- Connector v2\n  initial integration []", "- [GLM5.5 support](#14 )"
+        )
+        patched = patch_references(body, {}, REPOSITORY)
+        self.assertIn(
+            f"- [GLM5.5 support](https://github.com/{REPOSITORY}/issues/14)", patched
+        )
+        self.assertEqual(
+            parse_release(body, REPOSITORY), parse_release(patched, REPOSITORY)
+        )
 
     def test_multiline_markdown_link_label_round_trips(self):
         url = f"https://github.com/{REPOSITORY}/issues/14"
