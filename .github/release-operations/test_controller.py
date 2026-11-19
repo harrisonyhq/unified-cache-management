@@ -347,6 +347,8 @@ class MemoryGitHub:
         self.lose_milestone_response = False
         self.lose_project_response = False
         self.reactions = {}
+        self.pins = {}
+        self.pin_failure = False
         self.reaction_failure = False
 
     @staticmethod
@@ -364,7 +366,38 @@ class MemoryGitHub:
             "html_url": f"https://github.com/{REPOSITORY}/issues/{number}",
         }
 
-    def call(self, path):
+    def call(self, path, method="GET", data=None):
+        if path == "graphql":
+            if self.pin_failure:
+                raise OperationError("Pin API unavailable")
+            variables = data["variables"]
+            if data["query"].startswith("query"):
+                n = variables["number"]
+                return {
+                    "data": {
+                        "repository": {
+                            "issue": {"id": f"I_{n}", "isPinned": n in self.pins},
+                            "pinnedIssues": {
+                                "nodes": [
+                                    {
+                                        "issue": {"number": number},
+                                        "pinnedBy": {
+                                            "__typename": actor,
+                                            "login": actor,
+                                        },
+                                    }
+                                    for number, actor in self.pins.items()
+                                ]
+                            },
+                        }
+                    }
+                }
+            n = int(variables["id"].split("_")[1])
+            if "unpinIssue" in data["query"]:
+                self.pins.pop(n, None)
+            else:
+                self.pins[n] = "Bot"
+            return {"data": {}}
         return {"login": path.split("/")[-1]}
 
     def pages(self, path):
@@ -553,6 +586,51 @@ class MemoryGitHub:
 
 
 class RepositoryOperations(unittest.TestCase):
+    def test_only_release_is_pinned_and_owned_pin_can_be_released(self):
+        state = self.initialize()
+        self.assertEqual(self.api.pins, {1: "Bot"})
+        self.assertNotIn(state["archive"], self.api.pins)
+        self.controller.initialize_or_update(1, "release_init")
+        self.assertEqual(self.api.pins, {1: "Bot"})
+        state = self.controller.load(1)[1]
+        self.controller.release_pin(1, state, enabled=False)
+        self.assertFalse(self.api.pins)
+        state["published"] = {"tag": "v0.12.0"}
+        self.controller.release_pin(1, state)
+        self.assertFalse(self.api.pins)
+
+    def test_dry_run_does_not_pin(self):
+        self.controller.initialize_or_update(1, "release_init", True)
+        self.assertFalse(self.api.pins)
+
+    def test_manual_pin_is_preserved_on_release(self):
+        self.api.pins[1] = "User"
+        state = self.initialize()
+        self.controller.release_pin(1, state, enabled=False)
+        self.assertEqual(self.api.pins, {1: "User"})
+
+    def test_manual_unpin_is_preserved(self):
+        self.initialize()
+        self.api.pins.clear()
+        self.controller.initialize_or_update(1, "release_init")
+        self.assertFalse(self.api.pins)
+
+    def test_full_pin_slots_do_not_block_initialization(self):
+        self.api.pins = {40: "User", 41: "Bot", 42: "User"}
+        state = self.initialize()
+        self.assertTrue(state["initialized"])
+        self.assertIn("three", state["pin_warning"])
+        self.assertNotIn(1, self.api.pins)
+        self.api.pins.pop(42)
+        self.controller.initialize_or_update(1, "release_init")
+        self.assertIn(1, self.api.pins)
+
+    def test_pin_api_failure_is_reported_without_blocking_initialization(self):
+        self.api.pin_failure = True
+        state = self.initialize()
+        self.assertTrue(state["initialized"])
+        self.assertIn("Pin API unavailable", self.controller.load(1)[0]["body"])
+
     def test_command_acknowledges_before_start_and_reuses_reaction(self):
         command = self.api.comment(1, "/release_init --dry-run")
         original = self.controller.initialize_or_update
