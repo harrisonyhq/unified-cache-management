@@ -64,6 +64,13 @@ the Milestone due date. Verification and publication use the configured branch.
 
 ## PR and Project synchronization
 
+Formal initialization automatically pins the Release Issue above the repository
+Issues list. The Bug Archive remains accessible from the release receipt and
+native sub-issue relationship. Dry-runs leave pins untouched. Repeated initialization
+or updates retry a pending pin; occupied slots are reported without removing other
+Issues. Manual pins/unpins are retained. Successful publication removes only a
+Bot-managed Release pin. Published versions stay unpinned on repeated initialization.
+
 The Bot adds an `eyes` reaction to an authorized version-command comment when the
 controller starts processing it. PR conversation comments with local Issue
 references receive the same acknowledgement before reconciliation, including

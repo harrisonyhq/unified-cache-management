@@ -13,6 +13,7 @@ from pathlib import Path
 
 from associations import PullRequestAssociations
 from ownership import manual_mode, milestone_number
+from pinning import ReleasePinning
 from syntax import (
     OperationError,
     bind_entries,
@@ -97,7 +98,7 @@ class GitHub:
         )["data"]
 
 
-class Controller(PullRequestAssociations):
+class Controller(PullRequestAssociations, ReleasePinning):
     def __init__(self, api: GitHub, config: dict):
         self.api, self.config = api, config
         self.repository = config["repository"]
@@ -154,6 +155,11 @@ class Controller(PullRequestAssociations):
         return comment, state
 
     def save(self, release: int, state: dict, result: str):
+        if (
+            state.get("pin_warning")
+            and ("Release pin: " + state["pin_warning"]) not in result
+        ):
+            result += "\n\nRelease pin: " + state["pin_warning"]
         rows = []
         for key, entry in state["scope"].items():
             kind = "Requirement"
@@ -354,11 +360,14 @@ class Controller(PullRequestAssociations):
                 and state.get("initialized")
                 and not any(diff.values())
             ):
+                self.release_pin(release, state)
+                self.save(release, state, "Release pin checked")
                 self.reconcile(release)
                 _, state = self.load(release)
                 self.save(release, state, "范围一致，已完成状态对账。")
                 return
             if command == "release_init" and state.get("initialized"):
+                self.release_pin(release, state)
                 self.save(
                     release,
                     state,
@@ -472,6 +481,7 @@ class Controller(PullRequestAssociations):
             state["scope"] = desired
             state["readiness"] = {"status": "stale", "reason": "范围已更新"}
             state["initialized"] = True
+            self.release_pin(release, state)
             state["revision"] += 1
             state["history"].append(
                 f"- r{state['revision']} `/{command}`：{plan}；{parsed['change_note']}"
@@ -844,6 +854,10 @@ class Controller(PullRequestAssociations):
             f"milestones/{state['milestone']['number']}", "PATCH", {"state": "closed"}
         )
         self.api.rest(f"issues/{release}", "PATCH", {"state": "closed"})
+        self.release_pin(release, state, enabled=False)
+        self.save(
+            release, state, "已发布：[GitHub Release](" + receipt["html_url"] + ")"
+        )
 
     def authorize(self, actor: str):
         permission = self.api.rest(f"collaborators/{actor}/permission")["permission"]
