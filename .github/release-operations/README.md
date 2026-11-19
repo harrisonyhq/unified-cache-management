@@ -64,6 +64,15 @@ the Milestone due date. Verification and publication use the configured branch.
 
 ## PR and Project synchronization
 
+The Bot adds an `eyes` reaction to an authorized version-command comment when the
+controller starts processing it. PR conversation comments with local Issue
+references receive the same acknowledgement before reconciliation, including
+edits that remove a previous reference. Repeated requests reuse the Bot's reaction.
+The reaction means processing has started; execution results remain in the release
+receipt. Deleted comments, automated Bot comments, and unrelated conversation
+messages receive no acknowledgement. Reaction API failures are logged while the
+operation continues. A queued workflow acknowledges when its controller starts.
+
 Reference a local Issue in PR descriptions, conversation comments, review bodies,
 or inline review comments, using `#123`, `OWNER/REPO#123`, or a complete Issue URL.
 Each reconciliation reads all current sources, deduplicates references, and diffs

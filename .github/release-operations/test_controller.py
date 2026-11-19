@@ -346,6 +346,8 @@ class MemoryGitHub:
         self.lose_response_for = None
         self.lose_milestone_response = False
         self.lose_project_response = False
+        self.reactions = {}
+        self.reaction_failure = False
 
     @staticmethod
     def make_issue(number, title, body, labels):
@@ -405,6 +407,12 @@ class MemoryGitHub:
         raise AssertionError(path)
 
     def rest(self, path, method="GET", data=None):
+        if path.startswith("issues/comments/") and path.endswith("/reactions"):
+            if self.reaction_failure:
+                raise OperationError("Reaction endpoint unavailable")
+            return self.reactions.setdefault(
+                int(path.split("/")[2]), {"content": data["content"]}
+            )
         if path == "":
             return {"default_branch": "main"}
         if path.startswith("commits/"):
@@ -545,6 +553,89 @@ class MemoryGitHub:
 
 
 class RepositoryOperations(unittest.TestCase):
+    def test_command_acknowledges_before_start_and_reuses_reaction(self):
+        command = self.api.comment(1, "/release_init --dry-run")
+        original = self.controller.initialize_or_update
+
+        def execute(*args, **kwargs):
+            self.assertEqual(self.api.reactions[command["id"]]["content"], "eyes")
+            return original(*args, **kwargs)
+
+        self.controller.initialize_or_update = execute
+        event = {"issue": {"number": 1}, "comment": command, "sender": command["user"]}
+        self.controller.handle(event, "issue_comment")
+        self.controller.handle(event, "issue_comment")
+        self.assertEqual(len(self.api.reactions), 1)
+
+    def test_pr_issue_mention_acknowledges_before_reconciliation(self):
+        comment = self.api.comment(
+            10, f"Related [feature](https://github.com/{REPOSITORY}/issues/13)"
+        )
+
+        def reconcile(event):
+            self.assertIn(comment["id"], self.api.reactions)
+
+        self.controller.reconcile_all = reconcile
+        self.controller.handle(
+            {"issue": {"number": 10, "pull_request": {}}, "comment": comment},
+            "issue_comment",
+        )
+
+    def test_edit_removing_mention_acknowledges_cleanup(self):
+        comment = self.api.comment(10, "Reference removed")
+        self.controller.reconcile_all = lambda event: None
+        event = {
+            "action": "edited",
+            "issue": {"number": 10, "pull_request": {}},
+            "comment": comment,
+            "changes": {"body": {"from": "Related #13"}},
+        }
+        self.controller.handle(event, "issue_comment")
+        self.assertIn(comment["id"], self.api.reactions)
+
+    def test_unrelated_bot_and_deleted_comments_have_no_reaction(self):
+        self.controller.reconcile_all = lambda event: None
+        for body, kind, action in (
+            ("Hello", "User", "created"),
+            ("Related #13", "Bot", "created"),
+            ("Related #13", "User", "deleted"),
+        ):
+            comment = self.api.comment(10, body)
+            comment["user"]["type"] = kind
+            self.controller.handle(
+                {
+                    "action": action,
+                    "issue": {"number": 10, "pull_request": {}},
+                    "comment": comment,
+                },
+                "issue_comment",
+            )
+        self.assertFalse(self.api.reactions)
+
+    def test_reaction_failure_does_not_block_command(self):
+        self.api.reaction_failure = True
+        command = self.api.comment(1, "/release_init --dry-run")
+        self.controller.handle(
+            {"issue": {"number": 1}, "comment": command, "sender": command["user"]},
+            "issue_comment",
+        )
+        self.assertIn(
+            str(command["id"]), self.controller.load(1)[1]["processed_comments"]
+        )
+
+    def test_unauthorized_command_has_no_reaction(self):
+        def reject(actor):
+            raise OperationError("Permission denied")
+
+        self.controller.authorize = reject
+        command = self.api.comment(1, "/release_init")
+        with self.assertRaises(OperationError):
+            self.controller.handle(
+                {"issue": {"number": 1}, "comment": command, "sender": command["user"]},
+                "issue_comment",
+            )
+        self.assertFalse(self.api.reactions)
+
     def setUp(self):
         self.api = MemoryGitHub()
         self.controller = Controller(

@@ -20,6 +20,7 @@ from syntax import (
     issue_reference,
     parse_release,
     patch_references,
+    references,
     scope_diff,
 )
 
@@ -897,6 +898,11 @@ class Controller(PullRequestAssociations):
     def handle(self, event: dict, event_name: str, replay=False):
         if event_name == "issue_comment":
             if "pull_request" in event.get("issue", {}):
+                old_body = event.get("changes", {}).get("body", {}).get("from", "")
+                if references(
+                    event["comment"].get("body", "") + "\n" + old_body, self.repository
+                ):
+                    self.acknowledge_comment(event)
                 self.reconcile_all(event)
                 return
             command = event["comment"]["body"].strip()
@@ -912,6 +918,7 @@ class Controller(PullRequestAssociations):
                 return
             actor = event["sender"]["login"]
             self.authorize(actor)
+            self.acknowledge_comment(event)
             release = event["issue"]["number"]
             if not replay:
                 self.drain_commands(release, ceiling=event["comment"]["id"])
@@ -965,6 +972,25 @@ class Controller(PullRequestAssociations):
             self.save(release, latest, result)
         else:
             self.reconcile_all(event)
+
+    def acknowledge_comment(self, event):
+        comment = event.get("comment", {})
+        author = comment.get("user", event.get("sender", {}))
+        if (
+            event.get("action") == "deleted"
+            or author.get("type") == "Bot"
+            or not comment.get("id")
+        ):
+            return
+        try:
+            # GitHub reuses an existing reaction by this Bot on repeated requests.
+            self.api.rest(
+                f"issues/comments/{comment['id']}/reactions",
+                "POST",
+                {"content": "eyes"},
+            )
+        except OperationError as error:
+            print(f"Comment #{comment['id']} acknowledgement unavailable: {error}")
 
     def reconcile_all(self, event=None):
         errors = []
