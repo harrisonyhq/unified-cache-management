@@ -74,10 +74,17 @@ Generated content is excluded from scope parsing and revision comparison. Human
 fields, descriptions, custom sections, and checklist edits outside those regions
 are retained. Repeated refreshes replace the same regions.
 
-The trusted Bot comment keeps the compact operation result, workflow link, and
-machine checkpoint. Milestone/archive links, tables, readiness, and scope history
-are displayed in the body rather than duplicated in the comment. Existing Bot
-comments are updated in place, retaining state and command cursors.
+The bottom Bot region contains one latest operation line: a running arrow and
+workflow link during execution, a green check on success, or a red cross with a
+short reason on failure. Initialization, synchronization, verification, readiness,
+and publication use the same region. Nested steps preserve their outer operation.
+Preview plans remain in a collapsible panel until formal execution replaces them.
+
+The trusted checkpoint comment contains only machine data and is automatically
+collapsed. Existing notification text is removed in place, retaining object maps,
+verification, and command cursors. Results, links, tables, readiness, and scope
+history are displayed in the body. The workflow finalizer marks interrupted
+operations from its own run as failed without overwriting another run's status.
 
 ## PR and Project synchronization
 

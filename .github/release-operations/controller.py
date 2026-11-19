@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 from associations import PullRequestAssociations
+from operations import Operations, tracked
 from ownership import manual_mode, milestone_number
 from pinning import ReleasePinning
 from presentation import release_body
@@ -99,7 +100,7 @@ class GitHub:
         )["data"]
 
 
-class Controller(PullRequestAssociations, ReleasePinning):
+class Controller(PullRequestAssociations, ReleasePinning, Operations):
     def __init__(self, api: GitHub, config: dict):
         self.api, self.config = api, config
         self.repository = config["repository"]
@@ -161,23 +162,50 @@ class Controller(PullRequestAssociations, ReleasePinning):
             and ("Release pin: " + state["pin_warning"]) not in result
         ):
             result += "\n\nRelease pin: " + state["pin_warning"]
-        serialized = base64.b64encode(
-            json.dumps(state, ensure_ascii=False, separators=(",", ":")).encode()
-        ).decode()
-        body = (
-            SUMMARY_MARKER
-            + "\n\n## 版本操作结果\n\n"
-            + result
-            + f"\n\n[Workflow]({self.run_url})\n\n"
-        )
-        body += f"\n\n<!-- ucm-release-state:v1 {serialized} -->"
-        if len(body) > 60000:
-            raise OperationError("状态记录达到评论容量，请分片存储后继续")
+        state["last_result"] = result
+
+        def checkpoint():
+            serialized = base64.b64encode(
+                json.dumps(state, ensure_ascii=False, separators=(",", ":")).encode()
+            ).decode()
+            body = SUMMARY_MARKER + f"\n<!-- ucm-release-state:v1 {serialized} -->"
+            if len(body) > 60000:
+                raise OperationError("State checkpoint reached the comment capacity")
+            return body
+
         comment, _ = self.load(release)
         if comment:
-            self.api.rest(f"issues/comments/{comment['id']}", "PATCH", {"body": body})
+            comment = self.api.rest(
+                f"issues/comments/{comment['id']}", "PATCH", {"body": checkpoint()}
+            )
         else:
-            self.api.rest(f"issues/{release}/comments", "POST", {"body": body})
+            comment = self.api.rest(
+                f"issues/{release}/comments", "POST", {"body": checkpoint()}
+            )
+        attempted = getattr(self, "_minimize_attempted", None)
+        if attempted is None:
+            attempted = self._minimize_attempted = set()
+        if (
+            not state.get("checkpoint_minimized")
+            and comment.get("node_id")
+            and comment["id"] not in attempted
+        ):
+            attempted.add(comment["id"])
+            try:
+                self.api.call(
+                    "graphql",
+                    "POST",
+                    {
+                        "query": "mutation($id:ID!){minimizeComment(input:{subjectId:$id,classifier:OUTDATED}){minimizedComment{isMinimized}}}",
+                        "variables": {"id": comment["node_id"]},
+                    },
+                )
+                state["checkpoint_minimized"] = True
+                self.api.rest(
+                    f"issues/comments/{comment['id']}", "PATCH", {"body": checkpoint()}
+                )
+            except OperationError as error:
+                print(f"Checkpoint comment could not be collapsed: {error}")
         self.sync_release_body(release, state)
 
     def sync_release_body(self, release, state):
@@ -295,6 +323,7 @@ class Controller(PullRequestAssociations, ReleasePinning):
         if not actual or actual["number"] != parent:
             raise OperationError("父关系回读失败")
 
+    @tracked("initialize")
     def initialize_or_update(self, release: int, command: str, dry_run=False):
         source = self.issue(release)
         if "release" not in {label["name"] for label in source["labels"]}:
@@ -504,6 +533,7 @@ class Controller(PullRequestAssociations, ReleasePinning):
                 },
             )
 
+    @tracked("Release synchronization")
     def reconcile(self, release: int, event=None):
         _, state = self.load(release)
         if not state.get("initialized"):
@@ -601,6 +631,7 @@ class Controller(PullRequestAssociations, ReleasePinning):
                 "assignees": [p["login"] for p in issue.get("assignees", [])],
                 "milestone": milestone_number(issue),
             }
+        state["sync_warnings"] = problems
         self.save(
             release,
             state,
@@ -628,6 +659,7 @@ class Controller(PullRequestAssociations, ReleasePinning):
         record["event_id"] = max((event["id"] for event in changes), default=0)
         return record
 
+    @tracked("Release verification")
     def verify(
         self, release: int, number: int, passed: bool, evidence: str, actor: str
     ):
@@ -761,6 +793,7 @@ class Controller(PullRequestAssociations, ReleasePinning):
             return state, {"status": "blocked", "pending_prs": pending_prs}
         return state, {"status": "ready", "pending": []}
 
+    @tracked("Release publication")
     def publish(self, release: int):
         self.reconcile(release)
         state, result = self.readiness(release)
@@ -918,30 +951,44 @@ class Controller(PullRequestAssociations, ReleasePinning):
                 "command_cursor", 0
             ) or comment_id in before.get("processed_comments", []):
                 return
+            kind = {
+                "/release_init": "Release initialization",
+                "/update": "Release synchronization",
+                "/verify": "Release verification",
+                "/release_ready": "Release readiness",
+                "/release_publish": "Release publication",
+            }.get(command.split()[0], "Release operation")
+            if "--dry-run" in command:
+                kind += " preview"
             try:
-                if match := re.fullmatch(
-                    r"/(release_init|update)( --dry-run)?", command
-                ):
-                    self.initialize_or_update(release, match[1], bool(match[2]))
-                elif match := re.fullmatch(
-                    r"/verify #(\d+) (passed|failed) (https://\S+)", command
-                ):
-                    self.verify(
-                        release, int(match[1]), match[2] == "passed", match[3], actor
-                    )
-                elif command == "/release_ready":
-                    self.reconcile(release)
-                    state, result = self.readiness(release)
-                    state["readiness"] = result
-                    self.save(
-                        release,
-                        state,
-                        "发布准入：" + json.dumps(result, ensure_ascii=False),
-                    )
-                elif command == "/release_publish":
-                    self.publish(release)
-                else:
-                    raise OperationError("命令格式错误")
+                with self.operation(release, kind):
+                    if match := re.fullmatch(
+                        r"/(release_init|update)( --dry-run)?", command
+                    ):
+                        self.initialize_or_update(release, match[1], bool(match[2]))
+                    elif match := re.fullmatch(
+                        r"/verify #(\d+) (passed|failed) (https://\S+)", command
+                    ):
+                        self.verify(
+                            release,
+                            int(match[1]),
+                            match[2] == "passed",
+                            match[3],
+                            actor,
+                        )
+                    elif command == "/release_ready":
+                        self.reconcile(release)
+                        state, result = self.readiness(release)
+                        state["readiness"] = result
+                        self.save(
+                            release,
+                            state,
+                            "发布准入：" + json.dumps(result, ensure_ascii=False),
+                        )
+                    elif command == "/release_publish":
+                        self.publish(release)
+                    else:
+                        raise OperationError("命令格式错误")
             except Exception as error:
                 _, failed = self.load(release)
                 self.save(release, failed, f"执行失败：`{command}`\n\n{error}")
@@ -952,14 +999,7 @@ class Controller(PullRequestAssociations, ReleasePinning):
             latest["command_cursor"] = max(
                 latest.get("command_cursor", 0), int(comment_id)
             )
-            current_comment, _ = self.load(release)
-            # Preserve the actual result while checkpointing processed command IDs.
-            result = (
-                current_comment["body"]
-                .split("## 版本操作结果\n\n", 1)[1]
-                .split("\n\n[Workflow]", 1)[0]
-            )
-            self.save(release, latest, result)
+            self.save(release, latest, latest.get("last_result", ""))
         else:
             self.reconcile_all(event)
 
@@ -1006,6 +1046,7 @@ class Controller(PullRequestAssociations, ReleasePinning):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--finalize", action="store_true")
     parser.add_argument(
         "--config", type=Path, default=Path(__file__).with_name("config.json")
     )
@@ -1021,7 +1062,11 @@ def main():
     if repository != config["repository"]:
         raise OperationError("部署仓库与 config.json 的 repository 不一致")
     event = json.loads(args.event.read_text(encoding="utf-8")) if args.event else {}
-    Controller(GitHub(repository), config).handle(event, args.event_name)
+    controller = Controller(GitHub(repository), config)
+    if args.finalize:
+        controller.finalize_operations(os.environ.get("UCM_JOB_STATUS", "failure"))
+    else:
+        controller.handle(event, args.event_name)
     print(
         json.dumps(
             {"status": "completed", "event": args.event_name, "repository": repository}
