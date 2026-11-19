@@ -986,6 +986,7 @@ class Controller(PullRequestAssociations, ReleasePinning):
         errors = []
         self._pr_snapshot = self.api.pages("pulls?state=all")
         self._discussion_snapshot = {}
+        self._native_issue_snapshot = {}
         for release in self.releases():
             try:
                 self.drain_commands(release)
@@ -998,6 +999,7 @@ class Controller(PullRequestAssociations, ReleasePinning):
                 errors.append(f"Release #{release}: {error}")
         self._pr_snapshot = None
         self._discussion_snapshot = None
+        self._native_issue_snapshot = None
         if errors:
             raise OperationError("\n".join(errors))
 

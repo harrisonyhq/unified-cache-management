@@ -406,6 +406,8 @@ class MemoryGitHub:
         self.pins = {}
         self.pin_failure = False
         self.reaction_failure = False
+        self.native_links = {}
+        self.native_failure = False
 
     @staticmethod
     def make_issue(number, title, body, labels):
@@ -424,6 +426,36 @@ class MemoryGitHub:
 
     def call(self, path, method="GET", data=None):
         if path == "graphql":
+            if "closedByPullRequestsReferences" in data["query"]:
+                if self.native_failure:
+                    raise OperationError("Native associations unavailable")
+                n = data["variables"]["number"]
+                self.native_include_closed = "includeClosedPrs:true" in data["query"]
+                nodes = self.native_links.get(n, [])
+                offset = int(data["variables"].get("after") or 0)
+                page = nodes[offset : offset + 2]
+                return {
+                    "data": {
+                        "repository": {
+                            "issue": {
+                                "url": f"https://github.com/{REPOSITORY}/issues/{n}",
+                                "closedByPullRequestsReferences": {
+                                    "nodes": [
+                                        {
+                                            "number": p,
+                                            "repository": {"nameWithOwner": r},
+                                        }
+                                        for p, r in page
+                                    ],
+                                    "pageInfo": {
+                                        "hasNextPage": offset + len(page) < len(nodes),
+                                        "endCursor": str(offset + len(page)),
+                                    },
+                                },
+                            }
+                        }
+                    }
+                }
             if self.pin_failure:
                 raise OperationError("Pin API unavailable")
             variables = data["variables"]
@@ -642,6 +674,80 @@ class MemoryGitHub:
 
 
 class RepositoryOperations(unittest.TestCase):
+    def test_native_development_link_updates_metadata_and_table(self):
+        self.initialize()
+        self.api.projects["I_3"] = {"P_NATIVE": "REQ"}
+        self.api.add_pr(10, "No textual references")
+        self.api.native_links[3] = [(10, REPOSITORY)]
+        self.controller.reconcile(1)
+        state = self.controller.load(1)[1]
+        self.assertEqual(state["prs"]["10"]["native_issues"], [3])
+        self.assertEqual(self.api.prs[10]["milestone"]["number"], 1)
+        self.assertIn("P_NATIVE", self.api.projects["I_10"])
+        self.assertIn("| #3 | #10 (open)", self.api.items[1]["body"])
+        self.api.native_links[3] = []
+        self.controller.reconcile(1)
+        self.assertIsNone(self.api.prs[10]["milestone"])
+        self.assertNotIn("P_NATIVE", self.api.projects["I_10"])
+        self.assertNotIn("#10", self.api.items[1]["body"])
+
+    def test_native_and_comment_sources_are_unioned_and_deduplicated(self):
+        self.initialize()
+        self.api.add_pr(10, "#3")
+        self.api.native_links[3] = [(10, REPOSITORY)]
+        self.controller.reconcile(1)
+        self.api.prs[10]["body"] = ""
+        self.controller.reconcile(1)
+        self.assertEqual(self.api.prs[10]["milestone"]["number"], 1)
+        self.api.comment(10, "Implements #3")
+        self.api.native_links[3] = []
+        self.controller.reconcile(1)
+        record = self.controller.load(1)[1]["prs"]["10"]
+        self.assertEqual(record["requirements"], [3])
+        self.assertEqual(record["native_issues"], [])
+
+    def test_native_links_keep_merged_pr_and_closed_status(self):
+        self.initialize()
+        pr = self.api.add_pr(10, "")
+        self.api.native_links[3] = [(10, REPOSITORY)]
+        pr.update(state="closed", merged_at="2026-11-19T00:00:00Z")
+        self.controller.reconcile(1)
+        self.assertTrue(self.api.native_include_closed)
+        self.assertIn("| #3 | #10 (merged)", self.api.items[1]["body"])
+
+    def test_native_bug_link_uses_fix_target_and_bugfix_project(self):
+        state = self.initialize()
+        bug = self.api.make_issue(8, "Native Bug", "", ["bug"])
+        bug["milestone"] = {"number": 2, "title": "0.13.0"}
+        self.api.items[8] = bug
+        self.api.parents[8] = state["archive"]
+        self.api.add_pr(10, "")
+        self.api.native_links[8] = [(10, REPOSITORY)]
+        self.controller.reconcile(1)
+        record = self.controller.load(1)[1]["prs"]["10"]
+        self.assertEqual(record["bugs"], [8])
+        self.assertEqual(record["last"], 2)
+        self.assertIn("P_BUG", self.api.projects["I_10"])
+
+    def test_native_link_pagination_and_repository_filter(self):
+        self.api.native_links[3] = [
+            (10, REPOSITORY),
+            (11, "other/repo"),
+            (12, REPOSITORY),
+        ]
+        refs = self.controller.native_references({3})
+        self.assertEqual(set(refs), {10, 12})
+
+    def test_native_query_failure_preserves_existing_associations(self):
+        self.initialize()
+        self.api.add_pr(10, "")
+        self.api.native_links[3] = [(10, REPOSITORY)]
+        self.controller.reconcile(1)
+        self.api.native_failure = True
+        with self.assertRaises(OperationError):
+            self.controller.reconcile(1)
+        self.assertEqual(self.api.prs[10]["milestone"]["number"], 1)
+
     def test_comment_is_compact_and_body_contains_managed_overview(self):
         self.initialize()
         comment, state = self.controller.load(1)
