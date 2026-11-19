@@ -79,10 +79,10 @@ release_date: TBD
 
 - [ ] Confirm the release scope.
 - [ ] Merge the required pull requests.
-- [ ] Complete requirement and bug fix verification.
+- [ ] Review and close completed requirements and resolved Bugs.
 - [ ] Resolve release blockers.
 - [ ] Finalize the release notes.
-- [ ] Run /release_ready and review the result.
+- [ ] Run /release_check and review the result.
 - [ ] Run /release_publish.
 - [ ] Verify the GitHub Release and tag.
 - [ ] Publish the wheel package and container image.

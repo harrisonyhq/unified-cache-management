@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 from associations import PullRequestAssociations
+from checks import ReleaseChecks
 from operations import Operations, tracked
 from ownership import manual_mode, milestone_number
 from pinning import ReleasePinning
@@ -32,14 +33,9 @@ STATE_RE = re.compile(r"<!-- ucm-release-state:v1 ([A-Za-z0-9+/=]+) -->")
 ORIGIN = "<!-- ucm-origin:{release}:{key} -->"
 
 
-def bug_progress(
-    closed: bool, verification: dict, merged: set[str], has_pr: bool
-) -> tuple[str, str]:
-    if closed and verification.get("result") == "Passed":
+def bug_progress(closed: bool, merged: set[str], has_pr: bool) -> tuple[str, str]:
+    if closed:
         return "status:verified", "Done"
-    reviewed_fixes = set(verification.get("merged_prs", []))
-    if verification.get("result") in ("Failed", "Passed") and merged == reviewed_fixes:
-        return "status:fixing", "In progress"
     if merged:
         return "status:verification", "In review"
     if has_pr:
@@ -100,7 +96,7 @@ class GitHub:
         )["data"]
 
 
-class Controller(PullRequestAssociations, ReleasePinning, Operations):
+class Controller(PullRequestAssociations, ReleasePinning, Operations, ReleaseChecks):
     def __init__(self, api: GitHub, config: dict):
         self.api, self.config = api, config
         self.repository = config["repository"]
@@ -141,6 +137,8 @@ class Controller(PullRequestAssociations, ReleasePinning, Operations):
         }
         if comment and (match := STATE_RE.search(comment["body"])):
             state = json.loads(base64.b64decode(match[1]).decode("utf-8"))
+        state.pop("readiness", None)
+        state.pop("verification", None)
         # Read historical snapshots without replaying the old requirement grammar.
         state["scope"] = {
             f"issue-{e['number']}": dict(
@@ -477,7 +475,7 @@ class Controller(PullRequestAssociations, ReleasePinning, Operations):
                 self.api.rest(f"issues/{release}", "PATCH", {"body": patched})
             # Keep the actual created title as a display value while key/number identify scope.
             state["scope"] = desired
-            state["readiness"] = {"status": "stale", "reason": "范围已更新"}
+            state["release_check"] = {"status": "not_checked"}
             state["initialized"] = True
             state["revision"] += 1
             state["history"].append(
@@ -500,8 +498,6 @@ class Controller(PullRequestAssociations, ReleasePinning, Operations):
         self,
         issue: dict,
         project_name: str,
-        verifier=None,
-        validation=None,
         status=None,
     ):
         project = self.config["projects"][project_name]
@@ -510,26 +506,16 @@ class Controller(PullRequestAssociations, ReleasePinning, Operations):
             project=project["id"],
             content=issue["node_id"],
         )["addProjectV2ItemById"]["item"]
-        for name, value in (
-            ("Validation owner", verifier),
-            ("Validation status", validation),
-            ("Status", status),
-        ):
-            if not value:
-                continue
-            spec = project["fields"][name]
-            if name == "Validation owner":
-                field_value = {"text": value}
-            else:
-                options = {o["name"]: o["id"] for o in spec["options"]}
-                field_value = {"singleSelectOptionId": options[value]}
+        if status:
+            spec = project["fields"]["Status"]
+            options = {o["name"]: o["id"] for o in spec["options"]}
             self.api.graphql(
                 """mutation($input:UpdateProjectV2ItemFieldValueInput!){updateProjectV2ItemFieldValue(input:$input){projectV2Item{id}}}""",
                 input={
                     "projectId": project["id"],
                     "itemId": item["id"],
                     "fieldId": spec["id"],
-                    "value": field_value,
+                    "value": {"singleSelectOptionId": options[status]},
                 },
             )
 
@@ -603,9 +589,8 @@ class Controller(PullRequestAssociations, ReleasePinning, Operations):
                 if bug["number"] in value.get("bugs", [])
             }
             merged = {key for key, value in related.items() if value.get("merged")}
-            verification = state.get("verification", {}).get(number, {})
             status_label, project_status = bug_progress(
-                bug["state"] == "closed", verification, merged, bool(related)
+                bug["state"] == "closed", merged, bool(related)
             )
             current_labels = [label["name"] for label in bug["labels"]]
             if status_label not in current_labels:
@@ -659,150 +644,16 @@ class Controller(PullRequestAssociations, ReleasePinning, Operations):
         record["event_id"] = max((event["id"] for event in changes), default=0)
         return record
 
-    @tracked("Release verification")
-    def verify(
-        self, release: int, number: int, passed: bool, evidence: str, actor: str
-    ):
-        if not re.fullmatch(r"https://\S+", evidence):
-            raise OperationError("验证记录需要 HTTPS 证据链接")
-        _, state = self.load(release)
-        active = {entry["number"] for entry in state["scope"].values()} | {
-            int(n) for n in state["bugs"]
-        }
-        if number not in active:
-            raise OperationError("验证对象属于当前版本的需求或源归档 Bug")
-        item = self.issue(number)
-        repository = self.api.rest("")
-        tested_commit = self.api.rest(
-            "commits/"
-            + state.get("metadata", {}).get("branch", repository["default_branch"])
-        )["sha"]
-        result = "Passed" if passed else "Failed"
-        body = f"<!-- ucm-verification:v1 -->\n验证对象：#{number}\n目标 Milestone：{milestone_number(item)}\n测试代码：{tested_commit}\n结果：{result}\n证据：{evidence}\n验证者：@{actor}"
-        self.api.rest(f"issues/{number}/comments", "POST", {"body": body})
-        status = (
-            "status:verified"
-            if "bug" in {x["name"] for x in item["labels"]}
-            else "status:accepted"
-        )
-        labels = [
-            x["name"] for x in item["labels"] if not x["name"].startswith("status:")
-        ]
-        labels.append(
-            status
-            if passed
-            else "status:fixing" if "bug" in labels else "status:developing"
-        )
-        self.api.rest(
-            f"issues/{number}",
-            "PATCH",
-            {"state": "closed" if passed else "open", "labels": labels},
-        )
-        state.setdefault("observed", {})[str(number)] = {
-            "state": "closed" if passed else "open",
-            "assignees": [p["login"] for p in item.get("assignees", [])],
-            "milestone": milestone_number(item),
-        }
-        state.setdefault("verification", {})[str(number)] = {
-            "result": result,
-            "evidence": evidence,
-            "actor": actor,
-            "milestone": milestone_number(item),
-            "tested_commit": tested_commit,
-            "merged_prs": [
-                key
-                for key, record in state["prs"].items()
-                if number in record.get("bugs", []) and record.get("merged")
-            ],
-        }
-        state["readiness"] = {"status": "stale", "reason": "验证记录已更新"}
-        self.save(release, state, f"已记录 #{number} 的验证：{result}")
-        if "bug" in labels:
-            self.project_item(
-                item, "Bugfix", actor, result, "Done" if passed else "In progress"
-            )
-        else:
-            membership = self.api.graphql(
-                """query($id:ID!){node(id:$id){... on Issue{projectItems(first:100){nodes{project{id}}}}}}""",
-                id=item["node_id"],
-            )["node"]["projectItems"]["nodes"]
-            existing_projects = {member["project"]["id"] for member in membership}
-            for name, project in self.config["projects"].items():
-                if project["id"] in existing_projects:
-                    self.project_item(
-                        item, name, actor, result, "Done" if passed else "In progress"
-                    )
-
-    def readiness(self, release: int):
-        _, state = self.load(release)
-        if not state.get("initialized"):
-            raise OperationError("版本尚未初始化")
-        source = self.issue(release)
-        current_plan = parse_release(source["body"], self.repository)
-        delta = scope_diff(state["scope"], current_plan["entries"])
-        if (
-            current_plan["version"] != state["version"]
-            or any(delta.values())
-            or current_plan["metadata"] != state.get("metadata")
-        ):
-            return state, {
-                "status": "blocked",
-                "reason": "正文范围待 /update 同步",
-                "diff": delta,
-            }
-        target = state["milestone"]["number"]
-        items = [self.issue(e["number"]) for e in state["scope"].values()]
-        items += [
-            i
-            for i in self.api.pages(f"issues?state=all&milestone={target}&labels=bug")
-            if "pull_request" not in i
-        ]
-        pending = []
-        repo = self.api.rest("")
-        head = self.api.rest(
-            "commits/" + state.get("metadata", {}).get("branch", repo["default_branch"])
-        )["sha"]
-        for item in {i["number"]: i for i in items}.values():
-            record = state.get("verification", {}).get(str(item["number"]), {})
-            if (
-                item["state"] != "closed"
-                or record.get("result") != "Passed"
-                or record.get("milestone") != target
-                or record.get("tested_commit") != head
-            ):
-                pending.append(item["number"])
-        if pending:
-            return state, {"status": "blocked", "pending": pending}
-        pending_prs = []
-        for number, record in state["prs"].items():
-            if not record.get("requirements") and not record.get("bugs"):
-                continue
-            if record.get("conflict"):
-                pending_prs.append(int(number))
-                continue
-            if record.get("last") != target:
-                continue
-            pr = self.api.rest("pulls/" + number)
-            if not pr.get("merged_at"):
-                pending_prs.append(int(number))
-                continue
-            comparison = self.api.rest(f"compare/{pr['merge_commit_sha']}...{head}")
-            if comparison["status"] not in ("ahead", "identical"):
-                pending_prs.append(int(number))
-        if pending_prs:
-            return state, {"status": "blocked", "pending_prs": pending_prs}
-        return state, {"status": "ready", "pending": []}
-
     @tracked("Release publication")
     def publish(self, release: int):
-        self.reconcile(release)
-        state, result = self.readiness(release)
-        state["readiness"] = result
+        state, result = self.release_check(release)
         if result["status"] != "ready":
             self.save(
                 release, state, "发布准入：" + json.dumps(result, ensure_ascii=False)
             )
-            raise OperationError("完成需求与目标 Bug 的验证后发布")
+            raise OperationError(
+                "Resolve the pending items in Release Check before publication"
+            )
         repo = self.api.rest("")
         commit = (
             state.get("published", {}).get("commit")
@@ -820,10 +671,6 @@ class Controller(PullRequestAssociations, ReleasePinning, Operations):
             + "\n".join(
                 f"- #{e['number']} {e['title']}" for e in state["scope"].values()
             )
-        )
-        notes += "\n\n" + "\n".join(
-            f"- 验证 #{n}：{v['evidence']}"
-            for n, v in state.get("verification", {}).items()
         )
         if existing and marker not in (existing[0].get("body") or ""):
             raise OperationError("该 Tag 已有其他发布入口，请维护者处理")
@@ -888,7 +735,7 @@ class Controller(PullRequestAssociations, ReleasePinning, Operations):
                     (
                         "/release_init",
                         "/update",
-                        "/verify",
+                        "/release_check",
                         "/release_ready",
                         "/release_publish",
                     )
@@ -933,7 +780,7 @@ class Controller(PullRequestAssociations, ReleasePinning, Operations):
                 (
                     "/release_init",
                     "/update",
-                    "/verify",
+                    "/release_check",
                     "/release_ready",
                     "/release_publish",
                 )
@@ -954,8 +801,8 @@ class Controller(PullRequestAssociations, ReleasePinning, Operations):
             kind = {
                 "/release_init": "Release initialization",
                 "/update": "Release synchronization",
-                "/verify": "Release verification",
-                "/release_ready": "Release readiness",
+                "/release_check": "Release check",
+                "/release_ready": "Release check",
                 "/release_publish": "Release publication",
             }.get(command.split()[0], "Release operation")
             if "--dry-run" in command:
@@ -966,25 +813,8 @@ class Controller(PullRequestAssociations, ReleasePinning, Operations):
                         r"/(release_init|update)( --dry-run)?", command
                     ):
                         self.initialize_or_update(release, match[1], bool(match[2]))
-                    elif match := re.fullmatch(
-                        r"/verify #(\d+) (passed|failed) (https://\S+)", command
-                    ):
-                        self.verify(
-                            release,
-                            int(match[1]),
-                            match[2] == "passed",
-                            match[3],
-                            actor,
-                        )
-                    elif command == "/release_ready":
-                        self.reconcile(release)
-                        state, result = self.readiness(release)
-                        state["readiness"] = result
-                        self.save(
-                            release,
-                            state,
-                            "发布准入：" + json.dumps(result, ensure_ascii=False),
-                        )
+                    elif command in ("/release_check", "/release_ready"):
+                        self.release_check(release)
                     elif command == "/release_publish":
                         self.publish(release)
                     else:
@@ -1022,14 +852,15 @@ class Controller(PullRequestAssociations, ReleasePinning, Operations):
         except OperationError as error:
             print(f"Comment #{comment['id']} acknowledgement unavailable: {error}")
 
-    def reconcile_all(self, event=None):
+    def reconcile_all(self, event=None, replay_commands=True):
         errors = []
         self._pr_snapshot = self.api.pages("pulls?state=all")
         self._discussion_snapshot = {}
         self._native_issue_snapshot = {}
         for release in self.releases():
             try:
-                self.drain_commands(release)
+                if replay_commands:
+                    self.drain_commands(release)
                 self.reconcile(release, event)
             except OperationError as error:
                 _, state = self.load(release)
