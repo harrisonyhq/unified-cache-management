@@ -5,6 +5,49 @@ from syntax import OperationError, parse_release, patch_pull_requests, reference
 
 
 class PullRequestAssociations:
+    def native_references(self, numbers):
+        """Read Development links, retaining closed and merged PRs."""
+        owner, name = self.repository.split("/")
+        cache = getattr(self, "_native_issue_snapshot", None)
+        if cache is None:
+            cache = {}
+        refs = {}
+        for number in sorted(numbers):
+            if number not in cache:
+                linked, cursor = [], None
+                while True:
+                    issue = self.api.call(
+                        "graphql",
+                        "POST",
+                        {
+                            "query": """query($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){issue(number:$number){url closedByPullRequestsReferences(first:100,after:$after,includeClosedPrs:true,excludeUserLinked:false){nodes{number repository{nameWithOwner}} pageInfo{hasNextPage endCursor}}}}}""",
+                            "variables": {
+                                "owner": owner,
+                                "name": name,
+                                "number": number,
+                                "after": cursor,
+                            },
+                        },
+                    )["data"]["repository"]["issue"]
+                    if issue is None:
+                        raise OperationError(
+                            f"Native association Issue #{number} is unavailable"
+                        )
+                    page = issue["closedByPullRequestsReferences"]
+                    linked.extend(
+                        (pr["number"], issue["url"])
+                        for pr in page["nodes"]
+                        if pr["repository"]["nameWithOwner"].lower()
+                        == self.repository.lower()
+                    )
+                    if not page["pageInfo"]["hasNextPage"]:
+                        break
+                    cursor = page["pageInfo"]["endCursor"]
+                cache[number] = linked
+            for pr, url in cache[number]:
+                refs.setdefault(pr, {}).setdefault(number, []).append(url)
+        return refs
+
     def memberships(self, item):
         result, cursor = {}, None
         while True:
@@ -82,12 +125,14 @@ class PullRequestAssociations:
         target = event.get("pull_request", {}).get("number")
         if "pull_request" in event.get("issue", {}):
             target = event["issue"]["number"]
-        requirements = set()
+        requirements, managed_bugs = set(), set()
         for number in self.releases():
             _, other = self.load(number)
             requirements.update(e["number"] for e in other["scope"].values())
+            managed_bugs.update(int(n) for n in other.get("bugs", {}))
         local_requirements = {e["number"] for e in state["scope"].values()}
         local_bugs = {int(n) for n in state["bugs"]}
+        native = self.native_references(requirements | managed_bugs | local_bugs)
         rows, problems = {}, []
         prs = getattr(self, "_pr_snapshot", None)
         if prs is None:
@@ -104,7 +149,9 @@ class PullRequestAssociations:
                 cache = {}
             if pr["number"] not in cache:
                 cache[pr["number"]] = self.discussion_references(pr)
-            sources = cache[pr["number"]]
+            sources = {n: list(urls) for n, urls in cache[pr["number"]].items()}
+            for number, urls in native.get(pr["number"], {}).items():
+                sources.setdefault(number, []).extend(urls)
             if (
                 not (set(sources) & (local_requirements | local_bugs))
                 and key not in state["prs"]
@@ -141,6 +188,9 @@ class PullRequestAssociations:
                 state=pr["state"],
                 draft=pr.get("draft", False),
                 sources={str(n): sources[n] for n in reqs + bugs},
+                native_issues=sorted(
+                    set(reqs + bugs) & native.get(pr["number"], {}).keys()
+                ),
             )
             state["prs"][key] = record
             targets = {milestone_number(i) for i in linked}

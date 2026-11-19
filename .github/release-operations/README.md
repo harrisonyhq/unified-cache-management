@@ -103,6 +103,20 @@ Each reconciliation reads all current sources, deduplicates references, and diff
 the resulting set. References in automated Bot comments are excluded from inputs.
 Execution receipts retain source permalinks.
 
+GitHub's native Development sidebar links are an additional association source.
+The controller reads `closedByPullRequestsReferences` using the repository token,
+includes manually linked and closed/merged PRs, and combines them with textual
+references. Removing a sidebar link preserves any remaining textual relationship;
+removing the last source cleans up automatic metadata and the table row. Native
+links have the same Milestone/Project ownership and conflict rules as mentions.
+Queries are paginated, restricted to this repository, and cached within a run.
+A failed native query aborts association reconciliation before cleanup.
+
+Sidebar link/unlink changes are picked up by the 15-minute schedule, `/update`,
+or manual workflow dispatch. PR lifecycle events refresh native links as well.
+GitHub Actions does not expose the timeline connected/disconnected activities as
+direct workflow triggers, so sidebar edits use these reconciliation entry points.
+
 - A scoped requirement supplies its Milestone and current native Projects.
 - A Bug supplies its target fix Milestone and the configured Bugfix Project.
 - Multiple requirements supply the union of their Projects.
