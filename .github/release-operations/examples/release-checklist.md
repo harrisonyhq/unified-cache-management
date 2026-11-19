@@ -1,5 +1,9 @@
 ### Release Information
 
+<!-- ucm-release-navigation:start -->
+Version links will appear after initialization.
+<!-- ucm-release-navigation:end -->
+
 version: 0.12.0
 branch: main
 goal: Complete the planned integrations and interface updates.
@@ -10,7 +14,7 @@ release_date: TBD
 ### Requirements
 
 - MiniMax M3.1 support
-  with vLLM-Ascend v0.32.0 [Issue]()
+  with vLLM-Ascend v0.32.0 []
 
   description:
     Integrate MiniMax M3.1 with vLLM-Ascend v0.32.0.
@@ -25,7 +29,7 @@ release_date: TBD
   pull_requests:
 
 - Connector v2 integration
-  for the first release [Issue]()
+  for the first release []
 
   description:
     Complete the initial Connector v2 integration.

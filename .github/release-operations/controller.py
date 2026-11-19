@@ -14,6 +14,7 @@ from pathlib import Path
 from associations import PullRequestAssociations
 from ownership import manual_mode, milestone_number
 from pinning import ReleasePinning
+from presentation import release_body
 from syntax import (
     OperationError,
     bind_entries,
@@ -160,18 +161,6 @@ class Controller(PullRequestAssociations, ReleasePinning):
             and ("Release pin: " + state["pin_warning"]) not in result
         ):
             result += "\n\nRelease pin: " + state["pin_warning"]
-        rows = []
-        for key, entry in state["scope"].items():
-            kind = "Requirement"
-            observed = state.get("observed", {}).get(str(entry["number"]), {})
-            validation = (
-                state.get("verification", {})
-                .get(str(entry["number"]), {})
-                .get("result", "待验证")
-            )
-            rows.append(
-                f"| {kind} | #{entry['number']} | @{entry.get('developer')} | {observed.get('state', 'open')} / {validation} |"
-            )
         serialized = base64.b64encode(
             json.dumps(state, ensure_ascii=False, separators=(",", ":")).encode()
         ).decode()
@@ -181,33 +170,6 @@ class Controller(PullRequestAssociations, ReleasePinning):
             + result
             + f"\n\n[Workflow]({self.run_url})\n\n"
         )
-        if state.get("milestone"):
-            body += f"Milestone：[目标版本]({state['milestone']['html_url']})\n\n"
-        if state.get("archive"):
-            body += f"主 Bug Issue：#{state['archive']}\n\n"
-        body += (
-            "| Item | Issue | Assignee | State / Validation |\n| --- | --- | --- | --- |\n"
-            + "\n".join(rows)
-        )
-        body = body.replace("@None", "待指定")
-        body += "\n\n### 缺陷与修复 PR\n\n| 对象 | 目标版本 | 管理方式 |\n| --- | --- | --- |\n"
-        for number, record in state.get("bugs", {}).items():
-            body += f"| Bug #{number} | {record.get('target_title') or '待定'} | {record['mode']} |\n"
-        for number, record in state.get("prs", {}).items():
-            body += f"| PR #{number} | {record.get('target_title') or '待定'} | {record['mode']} |\n"
-            for target, sources in record.get("sources", {}).items():
-                body += (
-                    f"\nIssue #{target}: "
-                    + ", ".join(f"[reference]({url})" for url in dict.fromkeys(sources))
-                    + "\n"
-                )
-        if state.get("readiness"):
-            body += (
-                "\n\n### 最近发布准入\n\n```json\n"
-                + json.dumps(state["readiness"], ensure_ascii=False)
-                + "\n```\n"
-            )
-        body += "\n\n### 最近范围操作\n\n" + "\n".join(state.get("history", [])[-8:])
         body += f"\n\n<!-- ucm-release-state:v1 {serialized} -->"
         if len(body) > 60000:
             raise OperationError("状态记录达到评论容量，请分片存储后继续")
@@ -216,6 +178,19 @@ class Controller(PullRequestAssociations, ReleasePinning):
             self.api.rest(f"issues/comments/{comment['id']}", "PATCH", {"body": body})
         else:
             self.api.rest(f"issues/{release}/comments", "POST", {"body": body})
+        self.sync_release_body(release, state)
+
+    def sync_release_body(self, release, state):
+        source = self.issue(release)
+        patched = release_body(source["body"], state)
+        if len(patched) > 60000:
+            raise OperationError("Release body reached the managed display limit")
+        if patched != source["body"]:
+            if self.issue(release)["body"] != source["body"]:
+                raise OperationError(
+                    "Release body changed during rendering; retry synchronization"
+                )
+            self.api.rest(f"issues/{release}", "PATCH", {"body": patched})
 
     def validate(self, parsed: dict, release: int, state: dict):
         if state.get("version") and state["version"] != parsed["version"]:
@@ -344,13 +319,7 @@ class Controller(PullRequestAssociations, ReleasePinning):
                 self.save(
                     release,
                     state,
-                    f"预览 `{command}`\n\nMilestone: {parsed['version']}\n\nBug Archive: "
-                    + (
-                        f"reuse #{state['archive']}"
-                        if state.get("archive")
-                        else "create or recover"
-                    )
-                    + "\n\n"
+                    f"预览 `{command}`\n\n"
                     + "\n".join(actions)
                     + f"\n\n```json\n{plan}\n```",
                 )
@@ -589,6 +558,7 @@ class Controller(PullRequestAssociations, ReleasePinning):
             record["target_title"] = (bug.get("milestone") or {}).get("title")
             state.setdefault("observed", {})[number] = {
                 "state": bug["state"],
+                "assignees": [p["login"] for p in bug.get("assignees", [])],
                 "milestone": record["last"],
             }
             if "bug" not in {label["name"] for label in bug["labels"]}:
@@ -628,6 +598,7 @@ class Controller(PullRequestAssociations, ReleasePinning):
             issue = self.issue(entry["number"])
             state.setdefault("observed", {})[str(issue["number"])] = {
                 "state": issue["state"],
+                "assignees": [p["login"] for p in issue.get("assignees", [])],
                 "milestone": milestone_number(issue),
             }
         self.save(
@@ -695,6 +666,11 @@ class Controller(PullRequestAssociations, ReleasePinning):
             "PATCH",
             {"state": "closed" if passed else "open", "labels": labels},
         )
+        state.setdefault("observed", {})[str(number)] = {
+            "state": "closed" if passed else "open",
+            "assignees": [p["login"] for p in item.get("assignees", [])],
+            "milestone": milestone_number(item),
+        }
         state.setdefault("verification", {})[str(number)] = {
             "result": result,
             "evidence": evidence,

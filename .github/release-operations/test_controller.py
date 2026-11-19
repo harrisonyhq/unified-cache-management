@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from controller import Controller, GitHub, bug_progress, manual_mode
+from presentation import NAV_START, OVERVIEW_END, OVERVIEW_START, release_body
 from syntax import (
     OperationError,
     bind_entries,
@@ -58,6 +59,58 @@ reason: Initial scope.
 
 
 class ParserContracts(unittest.TestCase):
+    def test_managed_regions_are_idempotent_and_do_not_change_scope(self):
+        state = {
+            "scope": {},
+            "bugs": {},
+            "milestone": {"html_url": "https://example.com/milestone"},
+            "version": "0.12.0",
+            "archive": 8,
+        }
+        updated = release_body(PLAN, state)
+        self.assertEqual(
+            parse_release(updated, REPOSITORY), parse_release(PLAN, REPOSITORY)
+        )
+        self.assertEqual(release_body(updated, state), updated)
+        self.assertLess(updated.index(NAV_START), updated.index("version:"))
+        self.assertTrue(updated.rstrip().endswith(OVERVIEW_END))
+        self.assertEqual(updated.count(OVERVIEW_START), 1)
+
+    def test_overview_unifies_requirement_and_bug_prs(self):
+        state = {
+            "scope": {"issue-14": {"number": 14, "developer": "owner"}},
+            "bugs": {"8": {}},
+            "prs": {"20": {"requirements": [14], "bugs": [8], "merged": True}},
+            "observed": {"8": {"state": "closed", "assignees": ["fixer"]}},
+        }
+        body = release_body(PLAN, state)
+        self.assertIn("| Issue | Pull requests | Assignee | State / Validation |", body)
+        self.assertIn("| #14 | #20 (merged) | @owner |", body)
+        self.assertIn("| #8 | #20 (merged) | @fixer | closed", body)
+        self.assertNotIn("| Item |", body)
+        self.assertNotIn("缺陷与修复", body)
+
+    def test_malformed_managed_markers_preserve_source(self):
+        body = PLAN + OVERVIEW_START + "Human text"
+        with self.assertRaises(OperationError):
+            release_body(body, {"scope": {}, "bugs": {}})
+
+    def test_native_pr_display_keeps_issue_identity(self):
+        body = PLAN.replace(
+            "initial integration []",
+            f"initial integration [Feature](https://github.com/{REPOSITORY}/issues/14)",
+        )
+        updated = patch_pull_requests(
+            body,
+            {14: [{"number": 20, "state": "closed", "merged_at": None}]},
+            REPOSITORY,
+        )
+        self.assertIn("initial integration #14", updated)
+        self.assertIn("    - #20 | closed", updated)
+        self.assertEqual(
+            parse_release(updated, REPOSITORY), parse_release(body, REPOSITORY)
+        )
+
     def test_multiline_title_description_and_empty_fields(self):
         parsed = parse_release(PLAN, REPOSITORY)
         self.assertEqual(
@@ -92,7 +145,7 @@ class ParserContracts(unittest.TestCase):
         entries = parse_release(PLAN, REPOSITORY)["entries"]
         mappings = {e["key"]: n for e, n in zip(entries, [14, 13])}
         patched = patch_references(PLAN, mappings, REPOSITORY)
-        self.assertIn("initial integration [#14]", patched)
+        self.assertIn("initial integration #14", patched)
         self.assertEqual(patch_references(patched, mappings, REPOSITORY), patched)
         actual = parse_release(patched, REPOSITORY)["entries"]
         self.assertEqual([e["key"] for e in actual], ["issue-14", "issue-13"])
@@ -106,7 +159,7 @@ class ParserContracts(unittest.TestCase):
         body = body.replace("Implement the connector.", f"See [{url}].")
         before = parse_release(body, REPOSITORY)["entries"]
         patched = patch_references(body, {}, REPOSITORY)
-        self.assertIn("initial integration [#14]", patched)
+        self.assertIn("initial integration #14", patched)
         self.assertIn(f"See [{url}].", patched)
         self.assertEqual(parse_release(patched, REPOSITORY)["entries"], before)
         self.assertEqual(patch_references(patched, {}, REPOSITORY), patched)
@@ -115,7 +168,7 @@ class ParserContracts(unittest.TestCase):
         body = PLAN.replace("- Connector v2", "- Connector [v2]")
         key = parse_release(body, REPOSITORY)["entries"][0]["key"]
         patched = patch_references(body, {key: 14}, REPOSITORY)
-        self.assertIn("- Connector [v2]\n  initial integration [#14]", patched)
+        self.assertIn("- Connector [v2]\n  initial integration #14", patched)
         self.assertEqual(parse_release(patched, REPOSITORY)["entries"][0]["number"], 14)
 
     def test_pr_refresh_normalizes_legacy_full_url_without_scope_changes(self):
@@ -124,7 +177,7 @@ class ParserContracts(unittest.TestCase):
             f"initial integration [https://github.com/{REPOSITORY}/issues/14]",
         )
         patched = patch_pull_requests(body, {}, REPOSITORY)
-        self.assertIn("initial integration [#14]", patched)
+        self.assertIn("initial integration #14", patched)
         self.assertEqual(
             parse_release(body, REPOSITORY)["entries"],
             parse_release(patched, REPOSITORY)["entries"],
@@ -163,12 +216,7 @@ class ParserContracts(unittest.TestCase):
                 expected = expected or entry
                 self.assertEqual(entry, expected)
                 patched = patch_references(body, {}, REPOSITORY)
-                self.assertRegex(
-                    patched,
-                    r"initial integration \[(?:Issue|#14)\]\(https://github.com/"
-                    + re.escape(REPOSITORY)
-                    + r"/issues/14\)",
-                )
+                self.assertIn("initial integration #14", patched)
                 self.assertEqual(patch_references(patched, {}, REPOSITORY), patched)
                 self.assertEqual(
                     parse_release(patched, REPOSITORY)["entries"][0], entry
@@ -183,16 +231,17 @@ class ParserContracts(unittest.TestCase):
         entry = parse_release(body, REPOSITORY)["entries"][0]
         self.assertEqual(entry["title"], "Connector integration")
         self.assertEqual(entry["number"], 14)
-        self.assertEqual(patch_references(body, {}, REPOSITORY), body)
+        self.assertEqual(
+            parse_release(patch_references(body, {}, REPOSITORY), REPOSITORY),
+            parse_release(body, REPOSITORY),
+        )
 
     def test_issue15_whole_title_and_short_destination(self):
         body = PLAN.replace(
             "- Connector v2\n  initial integration []", "- [GLM5.5 support](#14 )"
         )
         patched = patch_references(body, {}, REPOSITORY)
-        self.assertIn(
-            f"- [GLM5.5 support](https://github.com/{REPOSITORY}/issues/14)", patched
-        )
+        self.assertIn("- GLM5.5 support #14", patched)
         self.assertEqual(
             parse_release(body, REPOSITORY), parse_release(patched, REPOSITORY)
         )
@@ -205,7 +254,7 @@ class ParserContracts(unittest.TestCase):
         )
         before = parse_release(body, REPOSITORY)["entries"]
         patched = patch_references(body, {}, REPOSITORY)
-        self.assertIn(f"- [Connector v2 initial integration]({url})", patched)
+        self.assertIn("- Connector v2 initial integration #14", patched)
         self.assertEqual(before, parse_release(patched, REPOSITORY)["entries"])
         self.assertEqual(patch_references(patched, {}, REPOSITORY), patched)
 
@@ -216,7 +265,7 @@ class ParserContracts(unittest.TestCase):
         self.assertEqual(entry["title"], "Connector v2 initial integration")
         patched = patch_references(body, {entry["key"]: 14}, REPOSITORY)
         self.assertIn(
-            f"initial integration [#14](https://github.com/{REPOSITORY}/issues/14)",
+            "initial integration #14",
             patched,
         )
         self.assertFalse(
@@ -586,6 +635,30 @@ class MemoryGitHub:
 
 
 class RepositoryOperations(unittest.TestCase):
+    def test_comment_is_compact_and_body_contains_managed_overview(self):
+        self.initialize()
+        comment, state = self.controller.load(1)
+        self.assertNotIn("| Issue |", comment["body"])
+        self.assertNotIn("主 Bug Issue：", comment["body"])
+        self.assertNotIn("Milestone：[目标版本]", comment["body"])
+        self.assertNotIn("缺陷与修复 PR", comment["body"])
+        body = self.api.items[1]["body"]
+        self.assertIn("**Bug Archive:** #2", body)
+        self.assertIn("| #3 |", body)
+        self.assertTrue(body.rstrip().endswith(OVERVIEW_END))
+        self.controller.save(1, state, "Refreshed")
+        self.assertEqual(self.api.items[1]["body"], body)
+
+    def test_human_checklist_edits_survive_display_refresh(self):
+        state = self.initialize()
+        self.api.items[1]["body"] = self.api.items[1]["body"].replace(
+            "reason: Initial scope.",
+            "reason: Human decision.\n\n### Custom Notes\n\n- [x] Human checklist",
+        )
+        self.controller.save(1, state, "Refreshed")
+        self.assertIn("- [x] Human checklist", self.api.items[1]["body"])
+        self.assertIn("reason: Human decision.", self.api.items[1]["body"])
+
     def test_only_release_is_pinned_and_owned_pin_can_be_released(self):
         state = self.initialize()
         self.assertEqual(self.api.pins, {1: "Bot"})
@@ -849,7 +922,7 @@ class RepositoryOperations(unittest.TestCase):
         self.assertEqual(set(state["prs"]["10"]["requirements"]), {3, 4})
         self.assertEqual(self.api.prs[10]["milestone"]["number"], 1)
         self.assertEqual(set(self.api.projects["I_10"]), {"P_CONNECTOR", "P_STORE"})
-        self.assertEqual(self.api.items[1]["body"].count("/pull/10)"), 2)
+        self.assertEqual(self.api.items[1]["body"].count("    - #10 | open"), 2)
         self.api.prs[10]["body"] = ""
         self.api.comments.remove(comment)
         self.controller.reconcile(1)
@@ -861,7 +934,7 @@ class RepositoryOperations(unittest.TestCase):
         self.controller.reconcile(1)
         self.assertIsNone(self.api.prs[10]["milestone"])
         self.assertFalse(self.api.projects["I_10"])
-        self.assertNotIn("/pull/10)", self.api.items[1]["body"])
+        self.assertNotIn("#10", self.api.items[1]["body"])
         self.assertEqual(self.controller.load(1)[1]["revision"], 1)
 
     def test_pr_comment_event_triggers_reconciliation_without_a_command(self):
