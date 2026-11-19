@@ -91,7 +91,7 @@ class ParserContracts(unittest.TestCase):
             "observed": {"8": {"state": "closed", "assignees": ["fixer"]}},
         }
         body = release_body(PLAN, state)
-        self.assertIn("| Issue | Pull requests | Assignee | State / Validation |", body)
+        self.assertIn("| Issue | Pull requests | Assignee | State |", body)
         self.assertIn("| #14 | #20 (merged) | @owner |", body)
         self.assertIn("| #8 | #20 (merged) | @fixer | closed", body)
         self.assertNotIn("| Item |", body)
@@ -552,6 +552,10 @@ class MemoryGitHub:
         if path.startswith("collaborators/"):
             return {"permission": "write"}
         parts = path.split("/")
+        if parts[0] == "pulls" and len(parts) == 2:
+            return copy.deepcopy(self.prs[int(parts[1])])
+        if path.startswith("compare/"):
+            return {"status": getattr(self, "comparison_status", "ahead")}
         if parts[0] == "milestones" and len(parts) == 2 and method == "PATCH":
             item = next(m for m in self.milestones if m["number"] == int(parts[1]))
             item.update(data)
@@ -597,6 +601,8 @@ class MemoryGitHub:
                                 )
                     elif key == "assignees":
                         item[key] = [{"login": x} for x in value]
+                    elif key == "labels":
+                        item[key] = [{"name": x} for x in value]
                     else:
                         item[key] = value
             return copy.deepcopy(item)
@@ -686,6 +692,116 @@ class MemoryGitHub:
 
 
 class RepositoryOperations(unittest.TestCase):
+    def test_release_check_lists_open_features_bugs_and_missing_prs(self):
+        self.initialize()
+        bug = self.api.make_issue(8, "Open target Bug", "", ["bug"])
+        bug["milestone"] = self.api.milestones[0]
+        self.api.items[8] = bug
+        _, report = self.controller.release_check(1)
+        self.assertEqual(report["open_features"], [3, 4])
+        self.assertEqual(report["open_bugs"], [8])
+        self.assertEqual(report["features_without_pr"], [3, 4])
+        self.assertEqual(report["status"], "blocked")
+        self.assertIn("Feature Issues without PRs", self.api.items[1]["body"])
+        self.assertNotIn('"status": "stale"', self.api.items[1]["body"])
+
+    def test_release_check_distinguishes_open_and_closed_unmerged_prs(self):
+        self.initialize()
+        self.api.add_pr(10, "#3")
+        self.api.add_pr(11, "#4")["state"] = "closed"
+        _, report = self.controller.release_check(1)
+        self.assertEqual(report["unmerged_prs"], [10])
+        self.assertEqual(report["closed_unmerged_prs"], [11])
+        self.assertFalse(report["features_without_pr"])
+
+    def test_release_check_describes_pending_update_without_creating_scope(self):
+        self.initialize()
+        body = self.api.items[1]["body"]
+        self.api.items[1]["body"] = (
+            body[: body.index("- Store interface")]
+            + "- New feature []\n\n  description:\n    Planned work.\n\n  assignee:\n\n  pull_requests:\n\n### Change Log\n\nreason: Scope adjustment.\n"
+        )
+        count = len(self.api.items)
+        _, report = self.controller.release_check(1)
+        self.assertEqual(report["unsynced"]["removed"], ["#4"])
+        self.assertEqual(
+            report["unsynced"]["added"], ["New feature (Issue not created)"]
+        )
+        self.assertEqual(len(self.api.items), count)
+        self.assertEqual(self.controller.load(1)[1]["revision"], 1)
+
+    def test_merged_pr_must_be_in_release_branch_without_passed_records(self):
+        self.initialize()
+        for n in (3, 4):
+            self.api.items[n]["state"] = "closed"
+        self.api.add_pr(10, "#3").update(
+            state="closed", merged_at="2026-11-19T00:00:00Z", merge_commit_sha="b" * 40
+        )
+        self.api.comparison_status = "behind"
+        _, report = self.controller.release_check(1)
+        self.assertEqual(report["prs_outside_candidate"], [10])
+        self.api.comparison_status = "ahead"
+        state, report = self.controller.release_check(1)
+        self.assertEqual(report["status"], "ready")
+        self.assertNotIn("verification", state)
+
+    def test_release_check_command_does_not_replay_itself(self):
+        self.initialize()
+        comment = self.api.comment(1, "/release_check")
+        self.controller.handle(
+            {"issue": {"number": 1}, "comment": comment, "sender": comment["user"]},
+            "issue_comment",
+        )
+        state = self.controller.load(1)[1]
+        self.assertIn(str(comment["id"]), state["processed_comments"])
+        self.assertIn("✅ [Release check]", self.api.items[1]["body"])
+
+    def test_verify_command_is_retired_and_does_not_close_issue(self):
+        self.initialize()
+        comment = self.api.comment(1, "/verify #3 passed https://example.com/report")
+        self.controller.handle(
+            {"issue": {"number": 1}, "comment": comment, "sender": comment["user"]},
+            "issue_comment",
+        )
+        self.assertEqual(self.api.items[3]["state"], "open")
+        self.assertNotIn(comment["id"], self.api.reactions)
+        self.assertFalse(hasattr(self.controller, "verify"))
+
+    def test_publication_is_blocked_by_open_issues(self):
+        self.initialize()
+        with self.assertRaisesRegex(OperationError, "Release Check"):
+            self.controller.publish(1)
+        state = self.controller.load(1)[1]
+        self.assertNotIn("published", state)
+        self.assertEqual(state["release_check"]["status"], "blocked")
+
+    def test_release_check_includes_pr_assigned_directly_to_milestone(self):
+        self.initialize()
+        self.api.add_pr(10, "Infrastructure change")["milestone"] = self.api.milestones[
+            0
+        ]
+        _, report = self.controller.release_check(1)
+        self.assertEqual(report["unmerged_prs"], [10])
+
+    def test_cross_release_bug_fix_is_in_target_release_check(self):
+        self.initialize()
+        self.api.items[50] = self.api.make_issue(
+            50,
+            "Other release",
+            PLAN.replace("version: 0.12.0", "version: 0.13.0"),
+            ["release"],
+        )
+        self.controller.initialize_or_update(50, "release_init")
+        other = self.controller.load(50)[1]
+        bug = self.api.make_issue(8, "Retargeted Bug", "", ["bug"])
+        bug["milestone"] = self.api.milestones[0]
+        self.api.items[8] = bug
+        self.api.parents[8] = other["archive"]
+        self.api.add_pr(10, "Fixes #8")
+        _, report = self.controller.release_check(1)
+        self.assertIn(8, report["open_bugs"])
+        self.assertIn(10, report["unmerged_prs"])
+
     def test_operation_status_runs_then_succeeds_and_old_comment_is_hidden(self):
         observed = []
         original = self.controller.sync_release_body
@@ -1227,24 +1343,17 @@ class RepositoryOperations(unittest.TestCase):
         self.assertEqual(self.controller.load(1)[1]["prs"]["10"]["last"], 2)
         self.assertEqual(self.api.parents[8], state["archive"])
 
-    def test_changed_code_requires_current_verification(self):
-        state = self.initialize()
-        for entry in state["scope"].values():
-            self.api.items[entry["number"]]["state"] = "closed"
-        state["verification"] = {
-            str(e["number"]): {
-                "result": "Passed",
-                "milestone": 1,
-                "tested_commit": "old",
-            }
-            for e in state["scope"].values()
-        }
-        self.controller.save(1, state, "Previous candidate")
-        self.assertEqual(self.controller.readiness(1)[1]["status"], "blocked")
-        for record in state["verification"].values():
-            record["tested_commit"] = "a" * 40
-        self.controller.save(1, state, "Current candidate")
-        self.assertEqual(self.controller.readiness(1)[1]["status"], "ready")
+    def test_maintainer_closed_features_need_no_verification_records(self):
+        self.initialize()
+        for n in (3, 4):
+            self.api.items[n]["state"] = "closed"
+        state, report = self.controller.release_check(1)
+        self.assertEqual(report["status"], "ready")
+        self.assertEqual(report["features_without_pr"], [3, 4])
+        self.assertNotIn("verification", state)
+        self.assertNotIn(
+            "Pending", self.api.items[1]["body"].split("### Release Check")[0]
+        )
 
     def test_unassigned_bug_does_not_block_other_versions(self):
         self.initialize()
@@ -1262,12 +1371,9 @@ class RepositoryOperations(unittest.TestCase):
             manual_mode({"mode": "auto", "last": 1}, 1, True)["mode"], "manual"
         )
         self.assertEqual(
-            bug_progress(False, {}, {"9"}, True), ("status:verification", "In review")
+            bug_progress(False, {"9"}, True), ("status:verification", "In review")
         )
-        record = {"result": "Failed", "merged_prs": ["9"]}
-        self.assertEqual(
-            bug_progress(False, record, {"9"}, True), ("status:fixing", "In progress")
-        )
+        self.assertEqual(bug_progress(True, {"9"}, True), ("status:verified", "Done"))
 
 
 if __name__ == "__main__":

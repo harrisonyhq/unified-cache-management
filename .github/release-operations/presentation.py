@@ -1,7 +1,5 @@
 """Bot-owned Release body regions, separate from human-authored scope."""
 
-import json
-
 from syntax import OperationError
 
 NAV_START = "<!-- ucm-release-navigation:start -->"
@@ -61,11 +59,8 @@ def release_body(body, state):
                     )
                 )
                 prs.append(f"#{pr} ({status})")
-        validation = (
-            state.get("verification", {}).get(number, {}).get("result", "Pending")
-        )
         rows.append(
-            f"| #{number} | {', '.join(prs) or '-'} | {', '.join('@' + owner for owner in owners) or '-'} | {observed.get('state', 'open')} / {validation} |"
+            f"| #{number} | {', '.join(prs) or '-'} | {', '.join('@' + owner for owner in owners) or '-'} | {observed.get('state', 'open')} |"
         )
     overview = (
         "### Release Overview\n\nAutomatically maintained by the release bot.\n\n"
@@ -93,15 +88,53 @@ def release_body(body, state):
             + "\n\n</details>\n\n"
         )
     overview += (
-        "| Issue | Pull requests | Assignee | State / Validation |\n| --- | --- | --- | --- |\n"
+        "| Issue | Pull requests | Assignee | State |\n| --- | --- | --- | --- |\n"
         + "\n".join(rows)
     )
-    if state.get("readiness"):
-        overview += (
-            "\n\n<details>\n<summary>Release readiness</summary>\n\n```json\n"
-            + json.dumps(state["readiness"], ensure_ascii=False)
-            + "\n```\n\n</details>"
-        )
+    check = state.get("release_check")
+    if check:
+        overview += "\n\n### Release Check\n\n"
+        if check["status"] == "not_checked":
+            overview += "Run `/release_check` to inspect the current release."
+        else:
+            overview += (
+                "⚠️ Pending items"
+                if check["status"] == "blocked"
+                else "✅ No blocking items"
+            )
+            overview += f" — [Latest check]({check['url']})\n"
+            categories = (
+                ("features_without_pr", "Feature Issues without PRs"),
+                ("open_features", "Open feature Issues"),
+                ("open_bugs", "Open Bugs targeted for this version"),
+                ("unmerged_prs", "Open PRs awaiting merge"),
+                ("closed_unmerged_prs", "Closed PRs without merge (review)"),
+                ("other_version_prs", "PRs assigned to another version (review)"),
+                ("version_conflicts", "PR target-version conflicts"),
+                ("prs_outside_candidate", "Merged PRs missing from the release branch"),
+            )
+            for key, title in categories:
+                if check.get(key):
+                    overview += (
+                        "\n- **"
+                        + title
+                        + ":** "
+                        + ", ".join(f"#{n}" for n in check[key])
+                    )
+            for key, title in (
+                ("added", "Added requirements"),
+                ("removed", "Removed requirements"),
+                ("changed", "Edited requirements"),
+                ("metadata", "Edited release fields"),
+            ):
+                if check["unsynced"].get(key):
+                    overview += (
+                        "\n- **Pending `/update` — "
+                        + title
+                        + ":** "
+                        + ", ".join(check["unsynced"][key])
+                    )
+            overview += "\n\nSnapshot of the latest requested check. Run `/release_check` to refresh."
     if state.get("history"):
         overview += (
             "\n\n<details>\n<summary>Scope history</summary>\n\n"
