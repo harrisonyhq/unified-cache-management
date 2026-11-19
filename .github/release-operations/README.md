@@ -51,6 +51,8 @@ scope removals. Removal retains the Issue and clears its current release
 Milestone when that value still belongs to this version. Existing Issue titles
 and descriptions are maintained in the Issue; the release entry stores the
 version's plan. Assignee edits, including clearing an assigned owner, synchronize.
+Description whitespace at the end of a block is ignored in scope comparisons;
+the original Markdown remains intact.
 
 Release Information contains `version`, `branch`, `goal`, `release_manager`,
 `test_lead`, and `release_date`. Roles use one @username or an empty value. The
