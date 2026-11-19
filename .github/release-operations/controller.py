@@ -481,11 +481,11 @@ class Controller(PullRequestAssociations, ReleasePinning):
             state["scope"] = desired
             state["readiness"] = {"status": "stale", "reason": "范围已更新"}
             state["initialized"] = True
-            self.release_pin(release, state)
             state["revision"] += 1
             state["history"].append(
                 f"- r{state['revision']} `/{command}`：{plan}；{parsed['change_note']}"
             )
+            self.release_pin(release, state)
             self.save(
                 release,
                 state,
