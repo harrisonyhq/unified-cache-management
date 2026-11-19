@@ -68,7 +68,32 @@ def release_body(body, state):
             f"| #{number} | {', '.join(prs) or '-'} | {', '.join('@' + owner for owner in owners) or '-'} | {observed.get('state', 'open')} / {validation} |"
         )
     overview = (
-        "### Release Overview\n\nAutomatically maintained by the release bot.\n\n| Issue | Pull requests | Assignee | State / Validation |\n| --- | --- | --- | --- |\n"
+        "### Release Overview\n\nAutomatically maintained by the release bot.\n\n"
+    )
+    operation = state.get("operation")
+    if operation:
+        icon = {"running": "🔄", "success": "✅", "failure": "❌"}[operation["status"]]
+        overview += f"{icon} [{operation['kind']}]({operation['url']})"
+        if operation.get("error"):
+            overview += " — " + operation["error"]
+        overview += "\n\n"
+        if "preview" in operation["kind"] and operation["status"] != "running":
+            overview += (
+                "<details>\n<summary>Preview plan</summary>\n\n"
+                + state.get("last_result", "")
+                + "\n\n</details>\n\n"
+            )
+    warnings = state.get("sync_warnings", []) + (
+        [state["pin_warning"]] if state.get("pin_warning") else []
+    )
+    if warnings:
+        overview += (
+            "<details>\n<summary>Attention required</summary>\n\n"
+            + "\n".join("- " + w for w in warnings)
+            + "\n\n</details>\n\n"
+        )
+    overview += (
+        "| Issue | Pull requests | Assignee | State / Validation |\n| --- | --- | --- | --- |\n"
         + "\n".join(rows)
     )
     if state.get("readiness"):

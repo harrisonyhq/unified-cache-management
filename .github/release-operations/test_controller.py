@@ -406,6 +406,8 @@ class MemoryGitHub:
         self.pins = {}
         self.pin_failure = False
         self.reaction_failure = False
+        self.minimized_comments = set()
+        self.minimize_failure = False
         self.native_links = {}
         self.native_failure = False
 
@@ -426,6 +428,15 @@ class MemoryGitHub:
 
     def call(self, path, method="GET", data=None):
         if path == "graphql":
+            if "minimizeComment" in data["query"]:
+                if self.minimize_failure:
+                    raise OperationError("Minimize API unavailable")
+                self.minimized_comments.add(data["variables"]["id"])
+                return {
+                    "data": {
+                        "minimizeComment": {"minimizedComment": {"isMinimized": True}}
+                    }
+                }
             if "closedByPullRequestsReferences" in data["query"]:
                 if self.native_failure:
                     raise OperationError("Native associations unavailable")
@@ -596,6 +607,7 @@ class MemoryGitHub:
                 id=max([c["id"] for c in self.comments] + [0]) + 1,
                 user={"login": "github-actions[bot]", "type": "Bot"},
             )
+            comment["node_id"] = "IC_" + str(comment["id"])
             self.comments.append(comment)
             return copy.deepcopy(comment)
         if parts[-1] == "parent":
@@ -674,6 +686,81 @@ class MemoryGitHub:
 
 
 class RepositoryOperations(unittest.TestCase):
+    def test_operation_status_runs_then_succeeds_and_old_comment_is_hidden(self):
+        observed = []
+        original = self.controller.sync_release_body
+
+        def capture(release, state):
+            observed.append(
+                (
+                    state.get("operation", {}).get("status"),
+                    state.get("operation", {}).get("kind"),
+                )
+            )
+            return original(release, state)
+
+        self.controller.sync_release_body = capture
+        self.initialize()
+        body = self.api.items[1]["body"]
+        self.assertTrue(any(status == "running" for status, _ in observed))
+        self.assertIn("✅ [Release initialization]", body)
+        self.assertNotIn("🔄", body)
+        self.assertEqual({kind for _, kind in observed}, {"Release initialization"})
+        comment, state = self.controller.load(1)
+        self.assertNotIn("版本操作结果", comment["body"])
+        self.assertNotIn("同步完成", comment["body"])
+        self.assertIn(comment["node_id"], self.api.minimized_comments)
+        self.assertTrue(state["checkpoint_minimized"])
+
+    def test_failure_status_has_short_error_and_retry_becomes_green(self):
+        self.api.items[1]["body"] = PLAN.replace("version: 0.12.0", "version: invalid")
+        with self.assertRaises(OperationError):
+            self.controller.initialize_or_update(1, "release_init")
+        self.assertIn("❌ [Release initialization]", self.api.items[1]["body"])
+        self.assertEqual(self.controller.load(1)[1]["operation"]["status"], "failure")
+        self.api.items[1]["body"] = PLAN
+        self.initialize()
+        self.assertIn("✅ [Release initialization]", self.api.items[1]["body"])
+        self.assertNotIn("❌", self.api.items[1]["body"])
+
+    def test_latest_sync_replaces_status_without_appending_lines(self):
+        self.initialize()
+        self.controller.run_url = "https://example.com/runs/new"
+        self.controller.reconcile(1)
+        body = self.api.items[1]["body"]
+        self.assertIn(
+            "✅ [Release synchronization](https://example.com/runs/new)", body
+        )
+        self.assertNotIn("✅ [Release initialization]", body)
+        self.assertEqual(body.count("✅ ["), 1)
+
+    def test_preview_plan_moves_to_body_and_retains_single_checkpoint(self):
+        self.controller.initialize_or_update(1, "release_init", True)
+        self.assertIn("✅ [Release initialization preview]", self.api.items[1]["body"])
+        self.assertIn("<summary>Preview plan</summary>", self.api.items[1]["body"])
+        self.initialize()
+        self.assertNotIn("<summary>Preview plan</summary>", self.api.items[1]["body"])
+        self.assertEqual(len(self.api.comments), 1)
+
+    def test_finalizer_marks_interrupted_current_run_and_preserves_other_runs(self):
+        self.initialize()
+        _, state = self.controller.load(1)
+        state["operation"]["status"] = "running"
+        self.controller.save(1, state, "Interrupted")
+        self.controller.finalize_operations("failure")
+        self.assertIn("❌", self.api.items[1]["body"])
+        state = self.controller.load(1)[1]
+        state["operation"].update(url="https://example.com/other", status="running")
+        self.controller.save(1, state, "Other run")
+        self.controller.finalize_operations("failure")
+        self.assertEqual(self.controller.load(1)[1]["operation"]["status"], "running")
+
+    def test_minimize_failure_keeps_checkpoint_and_operation_success(self):
+        self.api.minimize_failure = True
+        state = self.initialize()
+        self.assertEqual(state["operation"]["status"], "success")
+        self.assertTrue(state["initialized"])
+
     def test_native_development_link_updates_metadata_and_table(self):
         self.initialize()
         self.api.projects["I_3"] = {"P_NATIVE": "REQ"}
@@ -815,7 +902,7 @@ class RepositoryOperations(unittest.TestCase):
         self.api.pin_failure = True
         state = self.initialize()
         self.assertTrue(state["initialized"])
-        self.assertIn("Pin API unavailable", self.controller.load(1)[0]["body"])
+        self.assertIn("Pin API unavailable", self.api.items[1]["body"])
 
     def test_command_acknowledges_before_start_and_reuses_reaction(self):
         command = self.api.comment(1, "/release_init --dry-run")
@@ -1086,7 +1173,7 @@ class RepositoryOperations(unittest.TestCase):
         self.api.projects["I_10"] = {"P_MANUAL": "MANUAL"}
         self.controller.reconcile(1)
         self.assertIsNone(self.api.prs[10]["milestone"])
-        self.assertIn("conflicting", self.controller.load(1)[0]["body"])
+        self.assertIn("conflicting", self.api.items[1]["body"])
         self.assertEqual(set(self.api.projects["I_10"]), {"P_REQ", "P_MANUAL"})
         self.api.prs[10]["body"] = ""
         self.controller.reconcile(1)
@@ -1165,7 +1252,7 @@ class RepositoryOperations(unittest.TestCase):
             99, "Unassigned", "source_bug_archive: #", ["bug"]
         )
         self.controller.reconcile(1)
-        self.assertIn("待归档", self.controller.load(1)[0]["body"])
+        self.assertIn("待归档", self.api.items[1]["body"])
 
     def test_manual_milestone_ownership_and_bug_status(self):
         self.assertEqual(
