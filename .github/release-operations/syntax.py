@@ -299,6 +299,15 @@ def bind_entries(entries, objects):
 
 
 def scope_diff(previous, entries):
+    def value(entry, name):
+        content = entry.get(name)
+        # Trailing block whitespace has no rendered content; preserve the source.
+        return (
+            content.rstrip()
+            if name == "description" and isinstance(content, str)
+            else content
+        )
+
     current = {e["key"]: e for e in entries}
     return {
         "added": sorted(current.keys() - previous.keys()),
@@ -307,7 +316,7 @@ def scope_diff(previous, entries):
             k
             for k in current.keys() & previous.keys()
             if any(
-                previous[k].get(f) != current[k].get(f)
+                value(previous[k], f) != value(current[k], f)
                 for f in ("title", "description", "developer")
             )
         ),

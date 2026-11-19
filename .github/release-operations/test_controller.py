@@ -692,6 +692,25 @@ class MemoryGitHub:
 
 
 class RepositoryOperations(unittest.TestCase):
+    def test_description_trailing_whitespace_keeps_check_and_revision_stable(self):
+        self.initialize()
+        self.api.items[1]["body"] = self.api.items[1]["body"].replace(
+            "Implement the first interface.", "Implement the first interface. "
+        )
+        _, report = self.controller.release_check(1)
+        self.assertFalse(any(report["unsynced"].values()))
+        self.controller.initialize_or_update(1, "update")
+        self.assertEqual(self.controller.load(1)[1]["revision"], 1)
+        self.assertIn("Implement the first interface. \n", self.api.items[1]["body"])
+
+    def test_description_content_change_is_pending_update(self):
+        self.initialize()
+        self.api.items[1]["body"] = self.api.items[1]["body"].replace(
+            "Implement the first interface.", "Implement the revised interface. "
+        )
+        _, report = self.controller.release_check(1)
+        self.assertEqual(report["unsynced"]["changed"], ["#4"])
+
     def test_release_check_lists_open_features_bugs_and_missing_prs(self):
         self.initialize()
         bug = self.api.make_issue(8, "Open target Bug", "", ["bug"])
