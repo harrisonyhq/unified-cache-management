@@ -59,6 +59,13 @@ reason: Initial scope.
 
 
 class ParserContracts(unittest.TestCase):
+    def test_historical_release_keeps_text_and_gets_the_moved_overview(self):
+        original = "## Version information\n\nLegacy release notes.\n"
+        updated = release_body(original, {"scope": {}, "bugs": {}})
+        self.assertTrue(updated.startswith(original))
+        self.assertIn("### Release Overview", updated)
+        self.assertEqual(release_body(updated, {"scope": {}, "bugs": {}}), updated)
+
     def test_managed_regions_are_idempotent_and_do_not_change_scope(self):
         state = {
             "scope": {},

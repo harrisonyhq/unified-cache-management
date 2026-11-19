@@ -22,24 +22,23 @@ def replace_region(body, start, end, content):
 
 
 def release_body(body, state):
-    if "### Release Information" not in body:
-        return body  # Historical templates keep their existing body.
-    navigation = []
-    if state.get("milestone"):
-        navigation.append(
-            f"**Milestone:** [{state.get('version', '')}]({state['milestone']['html_url']})"
+    if "### Release Information" in body:
+        navigation = []
+        if state.get("milestone"):
+            navigation.append(
+                f"**Milestone:** [{state.get('version', '')}]({state['milestone']['html_url']})"
+            )
+        if state.get("archive"):
+            navigation.append(f"**Bug Archive:** #{state['archive']}")
+        body, nav = replace_region(
+            body,
+            NAV_START,
+            NAV_END,
+            " · ".join(navigation) or "Version links will appear after initialization.",
         )
-    if state.get("archive"):
-        navigation.append(f"**Bug Archive:** #{state['archive']}")
-    body, nav = replace_region(
-        body,
-        NAV_START,
-        NAV_END,
-        " · ".join(navigation) or "Version links will appear after initialization.",
-    )
-    heading = "### Release Information"
-    index = body.index(heading) + len(heading)
-    body = body[:index] + "\n\n" + nav + "\n\n" + body[index:].lstrip("\r\n")
+        heading = "### Release Information"
+        index = body.index(heading) + len(heading)
+        body = body[:index] + "\n\n" + nav + "\n\n" + body[index:].lstrip("\r\n")
 
     rows = []
     entries = {str(e["number"]): e for e in state["scope"].values()}
