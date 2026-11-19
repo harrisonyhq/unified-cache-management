@@ -15,7 +15,7 @@ and nested lists.
 
 ```markdown
 - Connector v2
-  initial integration [Issue]()
+  initial integration []
 
   description:
     Implement the connector.
@@ -28,13 +28,11 @@ and nested lists.
   pull_requests:
 ```
 
-A final `[Issue]()` creates an Issue. Use `[text](https://github.com/OWNER/REPO/issues/123)`
-to reuse a local Issue; the URL determines identity and the label controls display.
-The whole requirement title can also be a Markdown link. Pasted bare Issue URLs,
-short references, and legacy bracketed references remain accepted input. Writeback
-normalizes existing references to `[text](URL)` and creates `[#123](URL)` for new
-Issues. Nonempty link labels are preserved. Issue IDs identify
-synchronized scope. Creation-origin markers recover accepted requests after lost
+A final `[]` creates an Issue. An existing requirement ends in a native `#123`
+reference. Markdown links, bare URLs, and older bracket formats remain accepted
+input; writeback normalizes them to a title plus `#123` so GitHub can display
+native Issue references in lists. The whole title may be pasted as a Markdown link.
+Issue IDs identify synchronized scope. Creation-origin markers recover accepted requests after lost
 responses. Requirement parent relationships are managed by developers in GitHub.
 The controller retains historical snapshots and existing parent relationships.
 
@@ -61,6 +59,25 @@ Release Information contains `version`, `branch`, `goal`, `release_manager`,
 release manager is assigned to the Release Issue. The goal and roles are recorded
 in the Milestone description; `release_date` accepts YYYY-MM-DD or TBD and controls
 the Milestone due date. Verification and publication use the configured branch.
+
+## Release navigation and overview
+
+The Bot maintains two bounded regions in the Issue body. The navigation region
+sits directly under Release Information and links the Milestone and Bug Archive.
+The Release Overview region is always at the bottom, with one table for requirements
+and actual Bugs: Issue, Pull requests, Assignee, State / Validation. Issue and PR
+cells use native #number references. Lists can expand native references into title
+and state cards; the table also retains explicit Issue and PR states.
+
+Region markers start/end with `ucm-release-navigation` and `ucm-release-overview`.
+Generated content is excluded from scope parsing and revision comparison. Human
+fields, descriptions, custom sections, and checklist edits outside those regions
+are retained. Repeated refreshes replace the same regions.
+
+The trusted Bot comment keeps the compact operation result, workflow link, and
+machine checkpoint. Milestone/archive links, tables, readiness, and scope history
+are displayed in the body rather than duplicated in the comment. Existing Bot
+comments are updated in place, retaining state and command cursors.
 
 ## PR and Project synchronization
 
@@ -98,7 +115,7 @@ Execution receipts retain source permalinks.
 
 Choose requirement Projects in the Issue sidebar. The controller queries native
 Project membership and synchronizes associated PRs. `pull_requests:` is generated
-inside each release requirement, with draft/open/closed/merged status. Changes to
+inside each release requirement, with native PR references and draft/open/closed/merged status. Changes to
 this field alone refresh display without creating scope revisions.
 
 PR creation, body edits, state changes, and ordinary comment creation/edit/deletion

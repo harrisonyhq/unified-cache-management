@@ -7,8 +7,12 @@ body:
     id: release_information
     attributes:
       label: Release Information
-      description: Complete the release information below.
+      description: Complete this section. The bot maintains version links and the bottom overview.
       value: |
+        <!-- ucm-release-navigation:start -->
+        Version links will appear after initialization.
+        <!-- ucm-release-navigation:end -->
+
         version: 0.12.0
         branch: main
         goal: Complete the planned integrations and interface updates.
@@ -21,10 +25,10 @@ body:
     id: requirements
     attributes:
       label: Requirements
-      description: Use two spaces for title continuations and fields, and four spaces for description content. Use [Issue]() to create an Issue, or [text](Issue URL) to reuse an Issue. The workflow maintains pull_requests.
+      description: Use two spaces for title continuations and fields, and four spaces for description content. Use [] for new Issues or a native Issue reference for existing Issues. The bot maintains pull_requests.
       value: |
         - MiniMax M3.1 support
-          with vLLM-Ascend v0.32.0 [Issue]()
+          with vLLM-Ascend v0.32.0 []
 
           description:
             Integrate MiniMax M3.1 with vLLM-Ascend v0.32.0.
@@ -39,7 +43,7 @@ body:
           pull_requests:
 
         - Connector v2 integration
-          for the first release [Issue]()
+          for the first release []
 
           description:
             Complete the initial Connector v2 integration.

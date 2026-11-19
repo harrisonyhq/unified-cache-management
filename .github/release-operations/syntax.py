@@ -107,9 +107,22 @@ def split_requirement_reference(value, repository):
     )
 
 
+def mask_bot_regions(body):
+    return re.sub(
+        r"<!-- ucm-release-(navigation|overview):start -->.*?<!-- ucm-release-\1:end -->",
+        lambda m: "\n" * m[0].count("\n"),
+        body,
+        flags=re.S,
+    )
+
+
 def sections(body):
     lines = body.splitlines()
-    heads = [(i, line[4:]) for i, line in enumerate(lines) if line.startswith("### ")]
+    heads = [
+        (i, line[4:])
+        for i, line in enumerate(mask_bot_regions(body).splitlines())
+        if line.startswith("### ")
+    ]
     found = {}
     for pos, (start, name) in enumerate(heads):
         if name in found:
@@ -145,6 +158,7 @@ def blocks(body):
 
 
 def parse_release(body, repository):
+    body = mask_bot_regions(body)
     lines, found = sections(body)
     if "Release Information" not in found:
         raise OperationError(
@@ -313,10 +327,14 @@ def patch_references(body, mappings, repository):
             for i in range(start, title_end)
             if lines[i].strip()
         ]
-        _, _, label, offset = split_requirement_reference(
+        prefix, _, label, offset = split_requirement_reference(
             " ".join(text for _, text in parts), repository
         )
-        link = f"[{label or '#' + str(number)}](https://github.com/{repository}/issues/{number})"
+        link = (
+            f"#{number}"
+            if prefix
+            else re.sub(r"\\([\\\[\]()])", r"\1", label or "") + f" #{number}"
+        )
         cursor = 0
         for position, (i, text) in enumerate(parts):
             if offset < cursor + len(text):
@@ -345,8 +363,6 @@ def patch_pull_requests(body, rows, repository):
                     else "draft" if pr.get("draft") else "open"
                 )
             )
-            suffix.append(
-                f"    - [#{pr['number']}](https://github.com/{repository}/pull/{pr['number']}) | {status}"
-            )
+            suffix.append(f"    - #{pr['number']} | {status}")
         lines[first + 1 : end] = suffix + [""]
     return "\n".join(lines).rstrip() + "\n"

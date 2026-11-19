@@ -138,6 +138,8 @@ class PullRequestAssociations:
                 bugs=bugs,
                 requirements=reqs,
                 merged=bool(pr.get("merged_at")),
+                state=pr["state"],
+                draft=pr.get("draft", False),
                 sources={str(n): sources[n] for n in reqs + bugs},
             )
             state["prs"][key] = record
