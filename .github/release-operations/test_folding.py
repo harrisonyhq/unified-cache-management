@@ -2,77 +2,12 @@ import unittest
 from html import escape
 
 import test_controller as fixtures
-from folding import fold_requirements, patch_issue_states
+from folding import fold_requirements
 from presentation import OVERVIEW_START, release_body
 from syntax import OperationError, parse_release, patch_pull_requests, patch_references
 
 
 class FoldingContracts(unittest.TestCase):
-    def test_status_survives_summary_closing_tag_on_its_own_line(self):
-        body = fold_requirements(fixtures.PLAN, fixtures.REPOSITORY)
-        entries = parse_release(body, fixtures.REPOSITORY)["entries"]
-        body = patch_references(body, {entries[0]["key"]: 14}, fixtures.REPOSITORY)
-        body = patch_issue_states(body, {14: "open"}, fixtures.REPOSITORY)
-        body = body.replace("open</summary>", "open\n</summary>", 1)
-        expected = parse_release(body, fixtures.REPOSITORY)
-        body = patch_issue_states(body, {14: "closed"}, fixtures.REPOSITORY)
-        self.assertEqual(parse_release(body, fixtures.REPOSITORY), expected)
-        self.assertEqual(body.count("<!-- ucm-issue-state:"), 1)
-        self.assertIn("🟣 closed</summary>", body)
-
-    def test_open_closed_and_reopened_status_preserves_scope(self):
-        body = fold_requirements(fixtures.PLAN.replace(" []", ""), fixtures.REPOSITORY)
-        entries = parse_release(body, fixtures.REPOSITORY)["entries"]
-        body = patch_references(
-            body, {e["key"]: n for e, n in zip(entries, [14, 13])}, fixtures.REPOSITORY
-        )
-        expected = parse_release(body, fixtures.REPOSITORY)
-        for state in ("open", "closed", "open"):
-            body = patch_issue_states(
-                body, {14: state, 13: "open"}, fixtures.REPOSITORY
-            )
-            self.assertIn(
-                ("🟢 open" if state == "open" else "🟣 closed") + "</summary>", body
-            )
-            self.assertEqual(parse_release(body, fixtures.REPOSITORY), expected)
-            self.assertEqual(
-                patch_issue_states(body, {14: state, 13: "open"}, fixtures.REPOSITORY),
-                body,
-            )
-            self.assertEqual(body.count("<!-- ucm-issue-state:"), 2)
-
-    def test_status_rendering_preserves_error_reporting_for_invalid_input(self):
-        body = fold_requirements(fixtures.PLAN, fixtures.REPOSITORY).replace(
-            "</summary>", "", 1
-        )
-        self.assertEqual(
-            patch_issue_states(body, {14: "open"}, fixtures.REPOSITORY), body
-        )
-        rendered = release_body(
-            body,
-            {"scope": {}, "bugs": {}, "observed": {"14": {"state": "open"}}},
-            fixtures.REPOSITORY,
-        )
-        self.assertIn("### Release Overview", rendered)
-
-    def test_real_sync_updates_status_without_scope_revision(self):
-        x = fixtures.RepositoryOperations()
-        x.setUp()
-        x.api.items[1]["body"] = fold_requirements(
-            fixtures.PLAN.replace(" []", ""), fixtures.REPOSITORY
-        )
-        before = x.initialize()
-        for state in ("closed", "open"):
-            x.api.items[3]["state"] = state
-            x.controller.reconcile(1)
-            after = x.controller.load(1)[1]
-            self.assertIn(f"ucm-issue-state:{state}", x.api.items[1]["body"])
-            self.assertEqual(after["scope"], before["scope"])
-            self.assertEqual(after["revision"], before["revision"])
-            self.assertEqual(len(x.api.items), 4)
-        x.controller.initialize_or_update(1, "update")
-        self.assertEqual(x.controller.load(1)[1]["revision"], before["revision"])
-
     def test_last_requirements_section_preserves_managed_regions(self):
         body = fold_requirements(fixtures.PLAN, fixtures.REPOSITORY)
         prefix, rest = body.split("### Requirements", 1)
@@ -99,7 +34,7 @@ class FoldingContracts(unittest.TestCase):
         )
         x.controller.initialize_or_update(1, "update")
         self.assertIn(
-            "Additional feature #5 <!-- ucm-issue-state:open -->",
+            "Additional feature #5</summary>",
             x.api.items[1]["body"],
         )
         begin = x.api.items[1]["body"].index("<details>\n<summary>Additional feature")
@@ -191,7 +126,7 @@ class FoldingContracts(unittest.TestCase):
         )
         x.initialize()
         self.assertIn(
-            "<summary>Connector v2\ninitial integration #3 <!-- ucm-issue-state:open -->",
+            "<summary>Connector v2\ninitial integration #3</summary>",
             x.api.items[1]["body"],
         )
         x.controller.initialize_or_update(1, "update")
@@ -222,4 +157,4 @@ class FoldingContracts(unittest.TestCase):
             x.initialize()
         x.initialize()
         self.assertEqual(len(x.api.items), 4)
-        self.assertIn("#4 <!-- ucm-issue-state:open -->", x.api.items[1]["body"])
+        self.assertIn("#4</summary>", x.api.items[1]["body"])

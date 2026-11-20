@@ -246,7 +246,11 @@ def parse_release(body, repository):
             prefix, number, label, _ = split_requirement_reference(title, repository)
         except OperationError as error:
             fail(str(error))
-        title = prefix or re.sub(r"\\([\\\[\]()])", r"\1", label or "")
+        title = (
+            prefix
+            or re.sub(r"\\([\\\[\]()])", r"\1", label or "")
+            or (f"Issue #{number}" if number else "")
+        )
         if not title:
             fail("provide a requirement title")
         if len(title) > 256:

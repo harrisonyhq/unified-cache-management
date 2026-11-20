@@ -94,6 +94,9 @@ def cards(body):
 
 
 def unfold_requirements(body):
+    from taskcards import as_folded
+
+    body = as_folded(body)
     found = cards(body)
     if found is None:
         return body
@@ -111,32 +114,14 @@ def unfold_requirements(body):
     return "\n".join(lines) + ("\n" if body.endswith("\n") else "")
 
 
-def patch_issue_states(body, states, repository):
-    """Show observed Issue state without adding it to the requirement title."""
-    from syntax import parse_release
-
-    try:
-        found = cards(body)
-        if found is None:
-            return body
-        lines, records = found
-        entries = parse_release(body, repository)["entries"]
-    except OperationError:
-        # Rendering execution results also needs to work for invalid user input.
-        return body
-    for card, entry in reversed(list(zip(records, entries))):
-        state = states.get(entry["number"])
-        if state not in ("open", "closed"):
-            continue
-        icon = "🟢" if state == "open" else "🟣"
-        rendered = [escape(part, quote=False) for part in card["title"]]
-        rendered[0] = "<summary>" + rendered[0]
-        rendered[-1] += f" <!-- ucm-issue-state:{state} --> {icon} {state}</summary>"
-        lines[card["summary"] : card["summary_end"]] = rendered
-    return "\n".join(lines) + ("\n" if body.endswith("\n") else "")
-
-
 def patch_references(body, mappings, repository):
+    from taskcards import patch
+
+    task = patch(
+        body, repository, lambda value: patch_references(value, mappings, repository)
+    )
+    if task is not None:
+        return task
     found = cards(body)
     if found is None:
         return None
@@ -173,6 +158,13 @@ def patch_references(body, mappings, repository):
 
 
 def patch_pull_requests(body, rows, repository):
+    from taskcards import patch
+
+    task = patch(
+        body, repository, lambda value: patch_pull_requests(value, rows, repository)
+    )
+    if task is not None:
+        return task
     if cards(body) is None:
         return None
     from syntax import parse_release
