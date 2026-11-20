@@ -736,7 +736,6 @@ class Controller(PullRequestAssociations, ReleasePinning, Operations, ReleaseChe
                         "/release_init",
                         "/update",
                         "/release_check",
-                        "/release_ready",
                         "/release_publish",
                     )
                 )
@@ -781,7 +780,6 @@ class Controller(PullRequestAssociations, ReleasePinning, Operations, ReleaseChe
                     "/release_init",
                     "/update",
                     "/release_check",
-                    "/release_ready",
                     "/release_publish",
                 )
             ):
@@ -802,7 +800,6 @@ class Controller(PullRequestAssociations, ReleasePinning, Operations, ReleaseChe
                 "/release_init": "Release initialization",
                 "/update": "Release synchronization",
                 "/release_check": "Release check",
-                "/release_ready": "Release check",
                 "/release_publish": "Release publication",
             }.get(command.split()[0], "Release operation")
             if "--dry-run" in command:
@@ -813,7 +810,7 @@ class Controller(PullRequestAssociations, ReleasePinning, Operations, ReleaseChe
                         r"/(release_init|update)( --dry-run)?", command
                     ):
                         self.initialize_or_update(release, match[1], bool(match[2]))
-                    elif command in ("/release_check", "/release_ready"):
+                    elif command == "/release_check":
                         self.release_check(release)
                     elif command == "/release_publish":
                         self.publish(release)
