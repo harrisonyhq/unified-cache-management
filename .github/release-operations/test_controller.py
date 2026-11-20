@@ -321,7 +321,6 @@ class ParserContracts(unittest.TestCase):
                 "  assignee: @harrisonyhq",
                 "  assignee: @harrisonyhq\n  assignee: @other",
             ),
-            PLAN.replace("integration []", "integration"),
             PLAN.replace("Store interface []", "Store interface [#abc]"),
             PLAN.replace(
                 "Store interface []",
@@ -692,6 +691,32 @@ class MemoryGitHub:
 
 
 class RepositoryOperations(unittest.TestCase):
+    def test_plain_titles_create_issues_and_write_back_multiline_references(self):
+        self.api.items[1]["body"] = PLAN.replace(" []", "")
+        state = self.initialize()
+        self.assertEqual(set(state["scope"]), {"issue-3", "issue-4"})
+        self.assertIn(
+            "- Connector v2\n  initial integration #3", self.api.items[1]["body"]
+        )
+        self.assertIn("- Store interface #4", self.api.items[1]["body"])
+        self.assertIn("Acceptance criteria:", self.api.items[3]["body"])
+        self.controller.initialize_or_update(1, "update")
+        self.assertEqual(len(self.api.items), 4)
+        self.assertEqual(self.controller.load(1)[1]["revision"], 1)
+
+    def test_update_creates_plain_title_requirement_once(self):
+        self.initialize()
+        self.api.items[1]["body"] = self.api.items[1]["body"].replace(
+            "### Change Log",
+            "- New feature\n\n  description:\n    New work.\n\n  assignee:\n\n  pull_requests:\n\n### Change Log",
+        )
+        self.controller.initialize_or_update(1, "update")
+        self.assertIn("- New feature #5", self.api.items[1]["body"])
+        self.assertEqual(self.api.items[5]["title"], "New feature")
+        self.controller.initialize_or_update(1, "update")
+        self.assertEqual(len(self.api.items), 5)
+        self.assertEqual(self.controller.load(1)[1]["revision"], 2)
+
     def test_description_trailing_whitespace_keeps_check_and_revision_stable(self):
         self.initialize()
         self.api.items[1]["body"] = self.api.items[1]["body"].replace(
@@ -1172,6 +1197,7 @@ class RepositoryOperations(unittest.TestCase):
         self.assertEqual(self.controller.load(1)[1]["revision"], 1)
 
     def test_recovery_after_lost_create_response(self):
+        self.api.items[1]["body"] = PLAN.replace(" []", "")
         self.api.lose_response_for = "Store interface"
         with self.assertRaises(OperationError):
             self.initialize()

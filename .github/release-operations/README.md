@@ -15,7 +15,7 @@ and nested lists.
 
 ```markdown
 - Connector v2
-  initial integration []
+  initial integration
 
   description:
     Implement the connector.
@@ -28,7 +28,8 @@ and nested lists.
   pull_requests:
 ```
 
-A final `[]` creates an Issue. An existing requirement ends in a native `#123`
+A title without an Issue reference creates a new Issue. Legacy empty placeholders
+remain accepted. An existing requirement ends in a native `#123`
 reference. Markdown links, bare URLs, and older bracket formats remain accepted
 input; writeback normalizes them to a title plus `#123` so GitHub can display
 native Issue references in lists. The whole title may be pasted as a Markdown link.
@@ -174,7 +175,7 @@ the bottom of the Release Issue:
 - Requirements added, removed, or edited since the last `/update`, plus changed
   Release Information fields.
 
-For example, adding `- Store v2 []` to the body creates a pending plan edit.
+For example, adding `- Store v2` to the body creates a pending plan edit.
 `/update` creates its Issue and applies the Milestone/assignee. Removing a
 requirement or editing its planned owner also requires `/update` to apply that
 change. `/release_check` reports these differences and preserves the synchronized

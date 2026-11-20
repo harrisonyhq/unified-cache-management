@@ -84,7 +84,9 @@ def split_requirement_reference(value, repository):
         if reference and not (
             re.fullmatch(r"#\d+", reference) or ISSUE_URL_RE.fullmatch(reference)
         ):
-            raise OperationError("Use [text](Issue URL), [](), or []")
+            raise OperationError(
+                "Use #number or an Issue URL to reference an existing Issue"
+            )
         return (
             value[: match.start()].rstrip(),
             issue_reference(reference, repository) if reference else None,
@@ -102,9 +104,7 @@ def split_requirement_reference(value, repository):
             None,
             match.start(),
         )
-    raise OperationError(
-        "End the title with [text](Issue URL) or [Issue]() for a new Issue"
-    )
+    return value, None, None, len(value)
 
 
 def mask_bot_regions(body):
@@ -336,14 +336,17 @@ def patch_references(body, mappings, repository):
             for i in range(start, title_end)
             if lines[i].strip()
         ]
-        prefix, _, label, offset = split_requirement_reference(
-            " ".join(text for _, text in parts), repository
-        )
+        title = " ".join(text for _, text in parts)
+        prefix, _, label, offset = split_requirement_reference(title, repository)
         link = (
             f"#{number}"
             if prefix
             else re.sub(r"\\([\\\[\]()])", r"\1", label or "") + f" #{number}"
         )
+        if offset == len(title):
+            i, text = parts[-1]
+            lines[i] = lines[i][:2] + text + " " + link
+            continue
         cursor = 0
         for position, (i, text) in enumerate(parts):
             if offset < cursor + len(text):
