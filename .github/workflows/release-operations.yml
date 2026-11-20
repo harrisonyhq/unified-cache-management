@@ -32,7 +32,6 @@ jobs:
        (startsWith(github.event.comment.body, '/release_init') ||
         startsWith(github.event.comment.body, '/update') ||
         startsWith(github.event.comment.body, '/release_check') ||
-        startsWith(github.event.comment.body, '/release_ready') ||
         startsWith(github.event.comment.body, '/release_publish')))
     runs-on: ubuntu-latest
     timeout-minutes: 15

@@ -184,7 +184,7 @@ Open requirements, open target Bugs, open target PRs, version conflicts, missing
 merge commits, and pending plan edits block publication. Missing feature PRs and
 closed unmerged PRs are review notes; maintainer closure records completion.
 The report is a snapshot of the last requested check. Run `/release_check` again
-for current results. `/release_ready` remains an alias for this command.
+for current results.
 
 `/release_publish` reruns the check before creating GitHub Release + Tag, verifies
 the published receipt and tag, and closes the Milestone and Release Issue.
