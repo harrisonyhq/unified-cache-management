@@ -8,36 +8,37 @@ body is available in [the example](examples/release-checklist.md).
 ## Input and commands
 
 All template headings and field names use English and ASCII punctuation.
-Each requirement is a collapsed `<details>` card. Put its title in `<summary>`,
-followed by `assignee:`, `description:`, and `pull_requests:` in that order.
-Description and generated PR content use at least two spaces. Summary titles can
-span multiple lines; they are joined with spaces for the Issue title. Descriptions
-retain paragraphs and nested lists.
+Each requirement starts with a task-list title. The Issue reference stays outside
+the collapsible Details so GitHub can show its native title/state presentation.
+Title continuation lines use two spaces. Inside Details, fields use two spaces,
+and description/PR content uses at least four spaces. Keep assignee, description,
+and pull_requests in that order. Titles and descriptions support multiple lines.
 
 ```markdown
-<details>
-<summary>Connector v2
-initial integration</summary>
+- [ ] Connector v2
+  initial integration
 
-assignee: @username
+  <details>
+  <summary>Details</summary>
 
-description:
-  Implement the connector.
+  assignee: @username
 
-  Acceptance criteria:
-  - Pass the integration test.
+  description:
+    Implement the connector.
 
-pull_requests:
+    Acceptance criteria:
+    - Pass the integration test.
 
-</details>
+  pull_requests:
+
+  </details>
 ```
 
-Existing flat-list requirements remain readable. Converting a checklist to cards
-preserves its Issue identities, descriptions, owners, PRs, and scope revision.
-Bot writeback updates the summary reference and the PR field inside the card.
-The Bot also appends an observed `open`/`closed` status badge to each linked
-summary. Status refreshes with normal reconciliation, including Issue closure and
-reopening. The badge is generated display data and is excluded from scope parsing.
+An existing Issue can also be referenced directly as `- [ ] #123`.
+The checkbox is presentation data and is excluded from scope comparisons.
+Existing flat lists and summary-title cards remain readable. Conversion preserves
+Issue identities and scope revisions, and removes the old generated status badges.
+Bot writeback updates the outer Issue reference and the PR field inside Details.
 
 A title without an Issue reference creates a new Issue. Legacy empty placeholders
 remain accepted. An existing requirement ends in a native `#123`

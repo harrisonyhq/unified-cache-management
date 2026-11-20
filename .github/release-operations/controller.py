@@ -209,7 +209,7 @@ class Controller(PullRequestAssociations, ReleasePinning, Operations, ReleaseChe
 
     def sync_release_body(self, release, state):
         source = self.issue(release)
-        patched = release_body(source["body"], state, self.repository)
+        patched = release_body(source["body"], state)
         if len(patched) > 60000:
             raise OperationError("Release body reached the managed display limit")
         if patched != source["body"]:

@@ -12,45 +12,49 @@ release_date: TBD
 
 ### Requirements
 
-<details>
-<summary>MiniMax M3.1 support
-with vLLM-Ascend v0.32.0</summary>
+- [ ] MiniMax M3.1 support
+  with vLLM-Ascend v0.32.0
 
-assignee:
+  <details>
+  <summary>Details</summary>
 
-description:
-  Integrate MiniMax M3.1 with vLLM-Ascend v0.32.0.
+  assignee:
 
-  Acceptance criteria:
-  - Complete model loading and inference.
-  - Verify cache reuse.
-  - Document the supported configuration.
+  description:
+    Integrate MiniMax M3.1 with vLLM-Ascend v0.32.0.
 
-pull_requests:
+    Acceptance criteria:
+    - Complete model loading and inference.
+    - Verify cache reuse.
+    - Document the supported configuration.
 
-</details>
+  pull_requests:
 
-<details>
-<summary>Connector v2 integration
-for the first release</summary>
+  </details>
 
-assignee:
+- [ ] Connector v2 integration
+  for the first release
 
-description:
-  Complete the initial Connector v2 integration.
+  <details>
+  <summary>Details</summary>
 
-  Scope:
-  - Define the connector interface.
-  - Implement the initial integration.
-  - Provide configuration examples.
+  assignee:
 
-  Acceptance criteria:
-  - Pass the functional tests.
-  - Document the interface and usage.
+  description:
+    Complete the initial Connector v2 integration.
 
-pull_requests:
+    Scope:
+    - Define the connector interface.
+    - Implement the initial integration.
+    - Provide configuration examples.
 
-</details>
+    Acceptance criteria:
+    - Pass the functional tests.
+    - Document the interface and usage.
+
+  pull_requests:
+
+  </details>
 
 ### Release Notes
 
