@@ -35,6 +35,9 @@ pull_requests:
 Existing flat-list requirements remain readable. Converting a checklist to cards
 preserves its Issue identities, descriptions, owners, PRs, and scope revision.
 Bot writeback updates the summary reference and the PR field inside the card.
+The Bot also appends an observed `open`/`closed` status badge to each linked
+summary. Status refreshes with normal reconciliation, including Issue closure and
+reopening. The badge is generated display data and is excluded from scope parsing.
 
 A title without an Issue reference creates a new Issue. Legacy empty placeholders
 remain accepted. An existing requirement ends in a native `#123`
