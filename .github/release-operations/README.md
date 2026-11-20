@@ -52,7 +52,6 @@ The controller retains historical snapshots and existing parent relationships.
 | `/update --dry-run` | Preview differences from the last synchronized scope. |
 | `/update` | Synchronize requirement additions/removals, assignees, metadata, and PR associations. |
 | `/release_check` | Inspect pending scope edits, feature PR coverage, open requirements/Bugs, unmerged PRs, version conflicts, and inclusion in the release branch. |
-| `/release_publish` | Publish a GitHub Release and Tag, verify the receipt, and close the Milestone/Release Issue. |
 
 Commands require repository write, maintain, or admin permission. Each command
 is a separate comment on the Release Issue. Update `reason:` in Change Log for
@@ -67,7 +66,7 @@ Release Information contains `version`, `branch`, `release_manager`,
 `test_lead`, and `release_date`. Roles use one @username or an empty value. The
 release manager is assigned to the Release Issue. The roles are recorded
 in the Milestone description; `release_date` accepts YYYY-MM-DD or TBD and controls
-the Milestone due date. Release checks and publication use the configured branch.
+the Milestone due date. Release checks use the configured branch.
 
 ## Release navigation and overview
 
@@ -85,8 +84,8 @@ are retained. Repeated refreshes replace the same regions.
 
 The bottom Bot region contains one latest operation line: a running arrow and
 workflow link during execution, a green check on success, or a red cross with a
-short reason on failure. Initialization, synchronization, release checks,
-and publication use the same region. Nested steps preserve their outer operation.
+short reason on failure. Initialization, synchronization, and release checks
+use the same region. Nested steps preserve their outer operation.
 Preview plans remain in a collapsible panel until formal execution replaces them.
 
 The trusted checkpoint comment contains only machine data and is automatically
@@ -101,8 +100,7 @@ Formal initialization automatically pins the Release Issue above the repository
 Issues list. The Bug Archive remains accessible from the release receipt and
 native sub-issue relationship. Dry-runs leave pins untouched. Repeated initialization
 or updates retry a pending pin; occupied slots are reported without removing other
-Issues. Manual pins/unpins are retained. Successful publication removes only a
-Bot-managed Release pin. Published versions stay unpinned on repeated initialization.
+Issues. Manual pins/unpins are retained. Closed Release Issues are skipped by automatic pinning.
 
 The Bot adds an `eyes` reaction to an authorized version-command comment when the
 controller starts processing it. PR conversation comments with local Issue
@@ -136,7 +134,7 @@ direct workflow triggers, so sidebar edits use these reconciliation entry points
 - A scoped requirement supplies its Milestone and current native Projects.
 - A Bug supplies its target fix Milestone and the configured Bugfix Project.
 - Multiple requirements supply the union of their Projects.
-- Conflicting Milestones require an explicit maintainer choice and block publication
+- Conflicting Milestones require an explicit maintainer choice and appear as pending items
   while automatic ownership is unresolved.
 - Maintainer Milestone changes/clears persist. Existing manual Project memberships
   remain; removing a managed membership manually suppresses its automatic re-add.
@@ -155,7 +153,7 @@ The observer checks out no code and supplies no artifacts to the receiver.
 `/release_init`, `/update`, manual dispatch, and the 15-minute schedule also
 reconcile existing references and subsequent Issue Milestone/Project changes.
 
-## Bugs, release checks, and publication
+## Bugs and release checks
 
 Initialization creates a Bug Archive as a native sub-issue of the Release Issue,
 with the source version's Milestone. Create actual Bugs under this archive, or
@@ -183,22 +181,20 @@ the bottom of the Release Issue:
 - Requirements added, removed, or edited since the last `/update`, plus changed
   Release Information fields.
 
-For example, adding `- Store v2` to the body creates a pending plan edit.
+For example, adding a Store v2 requirement card to the body creates a pending plan edit.
 `/update` creates its Issue and applies the Milestone/assignee. Removing a
 requirement or editing its planned owner also requires `/update` to apply that
 change. `/release_check` reports these differences and preserves the synchronized
 scope. A routine Issue/PR state refresh leaves the scope revision unchanged.
 
 Open requirements, open target Bugs, open target PRs, version conflicts, missing
-merge commits, and pending plan edits block publication. Missing feature PRs and
+merge commits, and pending plan edits are reported as blocking items. Missing feature PRs and
 closed unmerged PRs are review notes; maintainer closure records completion.
 The report is a snapshot of the last requested check. Run `/release_check` again
 for current results.
 
-`/release_publish` reruns the check before creating GitHub Release + Tag, verifies
-the published receipt and tag, and closes the Milestone and Release Issue.
-Wheel/container distribution steps remain checklist tasks for their publishing
-adapters.
+Release Check supplies a status report for maintainers and the repository's existing
+release publishing process.
 
 ## Deployment and interfaces
 
@@ -208,7 +204,7 @@ secret. Repository metadata uses `GITHUB_TOKEN`; Project API calls use the Proje
 credential. The workflow runs trusted default-branch code and reads PR content
 as data. No PR code build is required by this metadata workflow.
 
-`Controller.initialize_or_update`, `reconcile`, `release_check`, and `publish`
+`Controller.initialize_or_update`, `reconcile`, and `release_check`
 are Python interfaces. The CLI accepts `--config`, `--event`, and `--event-name`.
 Mutations go through `GitHub.rest`/`graphql`. The parser and PR association logic
 are separate modules using only the Python standard library.

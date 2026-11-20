@@ -645,77 +645,6 @@ class Controller(PullRequestAssociations, ReleasePinning, Operations, ReleaseChe
         record["event_id"] = max((event["id"] for event in changes), default=0)
         return record
 
-    @tracked("Release publication")
-    def publish(self, release: int):
-        state, result = self.release_check(release)
-        if result["status"] != "ready":
-            self.save(
-                release, state, "发布准入：" + json.dumps(result, ensure_ascii=False)
-            )
-            raise OperationError(
-                "Resolve the pending items in Release Check before publication"
-            )
-        repo = self.api.rest("")
-        commit = (
-            state.get("published", {}).get("commit")
-            or self.api.rest(
-                "commits/"
-                + state.get("metadata", {}).get("branch", repo["default_branch"])
-            )["sha"]
-        )
-        tag = "v" + state["version"]
-        existing = [r for r in self.api.pages("releases") if r["tag_name"] == tag]
-        marker = f"<!-- ucm-release:{self.repository}:{release} -->"
-        notes = (
-            marker
-            + f"\nRelease tracking: #{release}\n\n"
-            + "\n".join(
-                f"- #{e['number']} {e['title']}" for e in state["scope"].values()
-            )
-        )
-        if existing and marker not in (existing[0].get("body") or ""):
-            raise OperationError("该 Tag 已有其他发布入口，请维护者处理")
-        try:
-            tagged = self.api.rest("git/ref/tags/" + tag)["object"]
-        except OperationError as error:
-            if "404" not in str(error):
-                raise
-            tagged = None
-        if tagged and (tagged["type"] != "commit" or tagged["sha"] != commit):
-            raise OperationError("已有 Tag 的目标与本次发布代码不同")
-        published = (
-            existing[0]
-            if existing
-            else self.api.rest(
-                "releases",
-                "POST",
-                {
-                    "tag_name": tag,
-                    "target_commitish": commit,
-                    "name": "UCM " + state["version"],
-                    "body": notes,
-                },
-            )
-        )
-        receipt = self.api.rest(f"releases/{published['id']}")
-        if receipt["draft"] or receipt["tag_name"] != tag:
-            raise OperationError("Release 回读失败")
-        actual_tag = self.api.rest("git/ref/tags/" + tag)["object"]
-        if actual_tag["type"] != "commit" or actual_tag["sha"] != commit:
-            raise OperationError("发布 Tag 代码回读失败")
-        state["published"] = {"url": receipt["html_url"], "tag": tag, "commit": commit}
-        self.save(
-            release, state, "已发布：[GitHub Release](" + receipt["html_url"] + ")"
-        )
-        self.api.rest(
-            f"milestones/{state['milestone']['number']}", "PATCH", {"state": "closed"}
-        )
-        self.api.rest(f"issues/{release}", "PATCH", {"state": "closed"})
-        self.release_pin(release, state, enabled=False)
-        self.save(
-            release, state, "已发布：[GitHub Release](" + receipt["html_url"] + ")"
-        )
-
     def authorize(self, actor: str):
         permission = self.api.rest(f"collaborators/{actor}/permission")["permission"]
         if permission not in ("admin", "maintain", "write"):
@@ -737,7 +666,6 @@ class Controller(PullRequestAssociations, ReleasePinning, Operations, ReleaseChe
                         "/release_init",
                         "/update",
                         "/release_check",
-                        "/release_publish",
                     )
                 )
             ):
@@ -781,7 +709,6 @@ class Controller(PullRequestAssociations, ReleasePinning, Operations, ReleaseChe
                     "/release_init",
                     "/update",
                     "/release_check",
-                    "/release_publish",
                 )
             ):
                 return
@@ -801,7 +728,6 @@ class Controller(PullRequestAssociations, ReleasePinning, Operations, ReleaseChe
                 "/release_init": "Release initialization",
                 "/update": "Release synchronization",
                 "/release_check": "Release check",
-                "/release_publish": "Release publication",
             }.get(command.split()[0], "Release operation")
             if "--dry-run" in command:
                 kind += " preview"
@@ -813,8 +739,6 @@ class Controller(PullRequestAssociations, ReleasePinning, Operations, ReleaseChe
                         self.initialize_or_update(release, match[1], bool(match[2]))
                     elif command == "/release_check":
                         self.release_check(release)
-                    elif command == "/release_publish":
-                        self.publish(release)
                     else:
                         raise OperationError("命令格式错误")
             except Exception as error:

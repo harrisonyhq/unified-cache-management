@@ -490,10 +490,7 @@ class MemoryGitHub:
                     }
                 }
             n = int(variables["id"].split("_")[1])
-            if "unpinIssue" in data["query"]:
-                self.pins.pop(n, None)
-            else:
-                self.pins[n] = "Bot"
+            self.pins[n] = "Bot"
             return {"data": {}}
         return {"login": path.split("/")[-1]}
 
@@ -810,14 +807,6 @@ class RepositoryOperations(unittest.TestCase):
         self.assertNotIn(comment["id"], self.api.reactions)
         self.assertFalse(hasattr(self.controller, "verify"))
 
-    def test_publication_is_blocked_by_open_issues(self):
-        self.initialize()
-        with self.assertRaisesRegex(OperationError, "Release Check"):
-            self.controller.publish(1)
-        state = self.controller.load(1)[1]
-        self.assertNotIn("published", state)
-        self.assertEqual(state["release_check"]["status"], "blocked")
-
     def test_release_check_includes_pr_assigned_directly_to_milestone(self):
         self.initialize()
         self.api.add_pr(10, "Infrastructure change")["milestone"] = self.api.milestones[
@@ -1018,16 +1007,15 @@ class RepositoryOperations(unittest.TestCase):
         self.assertIn("- [x] Human checklist", self.api.items[1]["body"])
         self.assertIn("reason: Human decision.", self.api.items[1]["body"])
 
-    def test_only_release_is_pinned_and_owned_pin_can_be_released(self):
+    def test_only_open_release_is_pinned(self):
         state = self.initialize()
         self.assertEqual(self.api.pins, {1: "Bot"})
         self.assertNotIn(state["archive"], self.api.pins)
         self.controller.initialize_or_update(1, "release_init")
         self.assertEqual(self.api.pins, {1: "Bot"})
         state = self.controller.load(1)[1]
-        self.controller.release_pin(1, state, enabled=False)
-        self.assertFalse(self.api.pins)
-        state["published"] = {"tag": "v0.12.0"}
+        self.api.pins.clear()
+        self.api.items[1]["state"] = "closed"
         self.controller.release_pin(1, state)
         self.assertFalse(self.api.pins)
 
@@ -1035,10 +1023,10 @@ class RepositoryOperations(unittest.TestCase):
         self.controller.initialize_or_update(1, "release_init", True)
         self.assertFalse(self.api.pins)
 
-    def test_manual_pin_is_preserved_on_release(self):
+    def test_manual_pin_is_preserved_during_sync(self):
         self.api.pins[1] = "User"
         state = self.initialize()
-        self.controller.release_pin(1, state, enabled=False)
+        self.controller.release_pin(1, state)
         self.assertEqual(self.api.pins, {1: "User"})
 
     def test_manual_unpin_is_preserved(self):
