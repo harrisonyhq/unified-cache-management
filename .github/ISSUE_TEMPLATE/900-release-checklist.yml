@@ -25,10 +25,10 @@ body:
     id: requirements
     attributes:
       label: Requirements
-      description: Use two spaces for title continuations and fields, and four spaces for description content. Use [] for new Issues or a native Issue reference for existing Issues. The bot maintains pull_requests.
+      description: Use two spaces for title continuations and fields, and four spaces for description content. A title without an Issue reference creates a new Issue. Add an Issue reference to reuse an existing Issue. The bot maintains pull_requests.
       value: |
         - MiniMax M3.1 support
-          with vLLM-Ascend v0.32.0 []
+          with vLLM-Ascend v0.32.0
 
           description:
             Integrate MiniMax M3.1 with vLLM-Ascend v0.32.0.
@@ -43,7 +43,7 @@ body:
           pull_requests:
 
         - Connector v2 integration
-          for the first release []
+          for the first release
 
           description:
             Complete the initial Connector v2 integration.
