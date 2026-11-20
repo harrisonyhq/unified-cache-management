@@ -74,20 +74,6 @@ release_date: TBD
 - [ ] Build and verify the container image.
 - [ ] Confirm artifact versions match the release version.
 
-### Release Steps
-
-- [ ] Confirm the release scope.
-- [ ] Merge the required pull requests.
-- [ ] Review and close completed requirements and resolved Bugs.
-- [ ] Resolve release blockers.
-- [ ] Finalize the release notes.
-- [ ] Run /release_check and review the result.
-- [ ] Run /release_publish.
-- [ ] Verify the GitHub Release and tag.
-- [ ] Publish the wheel package and container image.
-- [ ] Verify the published artifacts.
-- [ ] Confirm the milestone and release issue are closed.
-
 ### Change Log
 
 reason: Initial scope.
