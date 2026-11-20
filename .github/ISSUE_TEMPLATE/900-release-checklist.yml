@@ -24,41 +24,47 @@ body:
     id: requirements
     attributes:
       label: Requirements
-      description: Use two spaces for title continuations and fields, and four spaces for description content. A title without an Issue reference creates a new Issue. Add an Issue reference to reuse an existing Issue. The bot maintains pull_requests.
+      description: Use one details block per requirement. Put the title in summary, then assignee, description, and pull_requests. Indent description and PR content by two spaces. A title without an Issue reference creates an Issue.
       value: |
-        - MiniMax M3.1 support
-          with vLLM-Ascend v0.32.0
+        <details>
+        <summary>MiniMax M3.1 support
+        with vLLM-Ascend v0.32.0</summary>
 
-          description:
-            Integrate MiniMax M3.1 with vLLM-Ascend v0.32.0.
+        assignee:
 
-            Acceptance criteria:
-            - Complete model loading and inference.
-            - Verify cache reuse.
-            - Document the supported configuration.
+        description:
+          Integrate MiniMax M3.1 with vLLM-Ascend v0.32.0.
 
-          assignee:
+          Acceptance criteria:
+          - Complete model loading and inference.
+          - Verify cache reuse.
+          - Document the supported configuration.
 
-          pull_requests:
+        pull_requests:
 
-        - Connector v2 integration
-          for the first release
+        </details>
 
-          description:
-            Complete the initial Connector v2 integration.
+        <details>
+        <summary>Connector v2 integration
+        for the first release</summary>
 
-            Scope:
-            - Define the connector interface.
-            - Implement the initial integration.
-            - Provide configuration examples.
+        assignee:
 
-            Acceptance criteria:
-            - Pass the functional tests.
-            - Document the interface and usage.
+        description:
+          Complete the initial Connector v2 integration.
 
-          assignee:
+          Scope:
+          - Define the connector interface.
+          - Implement the initial integration.
+          - Provide configuration examples.
 
-          pull_requests:
+          Acceptance criteria:
+          - Pass the functional tests.
+          - Document the interface and usage.
+
+        pull_requests:
+
+        </details>
     validations:
       required: true
   - type: textarea

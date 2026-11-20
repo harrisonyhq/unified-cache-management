@@ -158,6 +158,9 @@ def blocks(body):
 
 
 def parse_release(body, repository):
+    from folding import unfold_requirements
+
+    body = unfold_requirements(body)
     body = mask_bot_regions(body)
     lines, found = sections(body)
     if "Release Information" not in found:
@@ -325,6 +328,11 @@ def scope_diff(previous, entries):
 
 
 def patch_references(body, mappings, repository):
+    from folding import patch_references as patch_folded_references
+
+    folded = patch_folded_references(body, mappings, repository)
+    if folded is not None:
+        return folded
     parsed = parse_release(body, repository)
     lines, ranges = blocks(body)
     for entry, (start, end) in zip(parsed["entries"], ranges):
@@ -360,6 +368,11 @@ def patch_references(body, mappings, repository):
 
 
 def patch_pull_requests(body, rows, repository):
+    from folding import patch_pull_requests as patch_folded_pull_requests
+
+    folded = patch_folded_pull_requests(body, rows, repository)
+    if folded is not None:
+        return folded
     body = patch_references(body, {}, repository)
     parsed = parse_release(body, repository)
     lines, ranges = blocks(body)

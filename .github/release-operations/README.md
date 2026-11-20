@@ -8,31 +8,39 @@ body is available in [the example](examples/release-checklist.md).
 ## Input and commands
 
 All template headings and field names use English and ASCII punctuation.
-Requirements start with a top-level `- `. Title continuation and fields use two
-spaces; description and generated PR content use at least four spaces. Titles
-are joined with spaces when an Issue is created; descriptions retain paragraphs
-and nested lists.
+Each requirement is a collapsed `<details>` card. Put its title in `<summary>`,
+followed by `assignee:`, `description:`, and `pull_requests:` in that order.
+Description and generated PR content use at least two spaces. Summary titles can
+span multiple lines; they are joined with spaces for the Issue title. Descriptions
+retain paragraphs and nested lists.
 
 ```markdown
-- Connector v2
-  initial integration
+<details>
+<summary>Connector v2
+initial integration</summary>
 
-  description:
-    Implement the connector.
+assignee: @username
 
-    Acceptance criteria:
-    - Pass the integration test.
+description:
+  Implement the connector.
 
-  assignee: @username
+  Acceptance criteria:
+  - Pass the integration test.
 
-  pull_requests:
+pull_requests:
+
+</details>
 ```
+
+Existing flat-list requirements remain readable. Converting a checklist to cards
+preserves its Issue identities, descriptions, owners, PRs, and scope revision.
+Bot writeback updates the summary reference and the PR field inside the card.
 
 A title without an Issue reference creates a new Issue. Legacy empty placeholders
 remain accepted. An existing requirement ends in a native `#123`
 reference. Markdown links, bare URLs, and older bracket formats remain accepted
 input; writeback normalizes them to a title plus `#123` so GitHub can display
-native Issue references in lists. The whole title may be pasted as a Markdown link.
+native Issue references. The whole title may be pasted as a Markdown link.
 Issue IDs identify synchronized scope. Creation-origin markers recover accepted requests after lost
 responses. Requirement parent relationships are managed by developers in GitHub.
 The controller retains historical snapshots and existing parent relationships.
