@@ -22,7 +22,6 @@ PLAN = """### Release Information
 
 version: 0.12.0
 branch: main
-goal: Deliver the connector.
 release_manager: @harrisonyhq
 test_lead:
 release_date: TBD

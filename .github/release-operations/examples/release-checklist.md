@@ -6,7 +6,6 @@ Version links will appear after initialization.
 
 version: 0.12.0
 branch: main
-goal: Complete the planned integrations and interface updates.
 release_manager:
 test_lead:
 release_date: TBD

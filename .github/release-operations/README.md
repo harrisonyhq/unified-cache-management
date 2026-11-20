@@ -55,9 +55,9 @@ version's plan. Assignee edits, including clearing an assigned owner, synchroniz
 Description whitespace at the end of a block is ignored in scope comparisons;
 the original Markdown remains intact.
 
-Release Information contains `version`, `branch`, `goal`, `release_manager`,
+Release Information contains `version`, `branch`, `release_manager`,
 `test_lead`, and `release_date`. Roles use one @username or an empty value. The
-release manager is assigned to the Release Issue. The goal and roles are recorded
+release manager is assigned to the Release Issue. The roles are recorded
 in the Milestone description; `release_date` accepts YYYY-MM-DD or TBD and controls
 the Milestone due date. Release checks and publication use the configured branch.
 

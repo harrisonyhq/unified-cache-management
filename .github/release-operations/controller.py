@@ -139,6 +139,7 @@ class Controller(PullRequestAssociations, ReleasePinning, Operations, ReleaseChe
             state = json.loads(base64.b64decode(match[1]).decode("utf-8"))
         state.pop("readiness", None)
         state.pop("verification", None)
+        state.get("metadata", {}).pop("goal", None)
         # Read historical snapshots without replaying the old requirement grammar.
         state["scope"] = {
             f"issue-{e['number']}": dict(
@@ -396,7 +397,7 @@ class Controller(PullRequestAssociations, ReleasePinning, Operations, ReleaseChe
             target = state["milestone"]["number"]
             metadata = parsed["metadata"]
             milestone_fields = {
-                "description": f"Release tracking: #{release}\nGoal: {metadata.get('goal', '')}\nRelease manager: {metadata.get('release_manager', '')}\nTest lead: {metadata.get('test_lead', '')}",
+                "description": f"Release tracking: #{release}\nRelease manager: {metadata.get('release_manager', '')}\nTest lead: {metadata.get('test_lead', '')}",
                 "due_on": (
                     metadata["release_date"] + "T23:59:59Z"
                     if metadata.get("release_date") not in (None, "", "TBD")

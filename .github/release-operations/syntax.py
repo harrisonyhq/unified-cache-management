@@ -169,7 +169,6 @@ def parse_release(body, repository):
     allowed = {
         "version",
         "branch",
-        "goal",
         "release_manager",
         "test_lead",
         "release_date",
@@ -178,6 +177,8 @@ def parse_release(body, repository):
         if not lines[i].strip():
             continue
         match = re.fullmatch(r"([a-z_]+):[ ]*(.*)", lines[i])
+        if match and match[1] == "goal":
+            continue  # Read existing checklists while dropping the retired field.
         if not match or match[1] not in allowed or match[1] in info:
             raise OperationError(f"Line {i + 1}: invalid or duplicate release field")
         info[match[1]] = match[2].strip()
