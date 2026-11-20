@@ -19,7 +19,18 @@ def replace_region(body, start, end, content):
     return body, start + "\n" + content + "\n" + end
 
 
-def release_body(body, state):
+def release_body(body, state, repository=""):
+    from folding import patch_issue_states
+
+    body = patch_issue_states(
+        body,
+        {
+            int(n): value["state"]
+            for n, value in state.get("observed", {}).items()
+            if "state" in value
+        },
+        repository,
+    )
     if "### Release Information" in body:
         navigation = []
         if state.get("milestone"):

@@ -5,6 +5,10 @@ from html import escape, unescape
 
 from syntax import OperationError, mask_bot_regions, sections
 
+ISSUE_STATE_RE = re.compile(
+    r"\s*<!-- ucm-issue-state:(?:open|closed) -->\s*(?:🟢 open|🟣 closed)\s*$"
+)
+
 
 def cards(body):
     lines, found = sections(body)
@@ -35,12 +39,15 @@ def cards(body):
             fail(begin, "expected <summary>Requirement title</summary>")
         title, text = [], lines[i][len("<summary>") :]
         while not text.endswith("</summary>"):
+            text = ISSUE_STATE_RE.sub("", text)
             if "<" in text or i + 1 == end:
                 fail(i, "unclosed or invalid summary")
             title.append(unescape(text.strip()))
             i += 1
             text = lines[i].strip()
-        title.append(unescape(text[: -len("</summary>")].strip()))
+        title.append(
+            unescape(ISSUE_STATE_RE.sub("", text[: -len("</summary>")]).strip())
+        )
         title = [part for part in title if part]
         if not title:
             fail(summary, "provide a requirement title")
@@ -101,6 +108,31 @@ def unfold_requirements(body):
         block += ["  assignee: " + fields["assignee"][1], "", "  pull_requests:"]
         block += ["  " + line if line else "" for line in pulls]
         lines[card["start"] : card["end"]] = block + [""]
+    return "\n".join(lines) + ("\n" if body.endswith("\n") else "")
+
+
+def patch_issue_states(body, states, repository):
+    """Show observed Issue state without adding it to the requirement title."""
+    from syntax import parse_release
+
+    try:
+        found = cards(body)
+        if found is None:
+            return body
+        lines, records = found
+        entries = parse_release(body, repository)["entries"]
+    except OperationError:
+        # Rendering execution results also needs to work for invalid user input.
+        return body
+    for card, entry in reversed(list(zip(records, entries))):
+        state = states.get(entry["number"])
+        if state not in ("open", "closed"):
+            continue
+        icon = "🟢" if state == "open" else "🟣"
+        rendered = [escape(part, quote=False) for part in card["title"]]
+        rendered[0] = "<summary>" + rendered[0]
+        rendered[-1] += f" <!-- ucm-issue-state:{state} --> {icon} {state}</summary>"
+        lines[card["summary"] : card["summary_end"]] = rendered
     return "\n".join(lines) + ("\n" if body.endswith("\n") else "")
 
 
