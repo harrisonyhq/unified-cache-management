@@ -118,6 +118,35 @@ class ParserContracts(unittest.TestCase):
         with self.assertRaises(OperationError):
             release_body(body, {"scope": {}, "bugs": {}}, REPOSITORY)
 
+    def test_overview_replaces_only_the_table_in_an_existing_checklist(self):
+        table = (
+            "| Issue | Pull requests | Assignee | State |\n"
+            "| --- | --- | --- | --- |\n"
+            "| #14 | - | @owner | open |"
+        )
+        body = (
+            "Human-authored release notes.\n\n"
+            f"{OVERVIEW_START}\n"
+            "### Release Overview\n\nAutomatically maintained by the release bot.\n\n"
+            f"{table}\n{OVERVIEW_END}\n\n"
+            "<!-- ucm-release-check:start -->\n"
+            "### Release Check\n\nRun `/release_check` to check the current plan.\n"
+            "<!-- ucm-release-check:end -->\n\n"
+            f"{COMMAND_START}\n"
+            "### Latest Release Command\n\nCommand feedback.\n"
+            f"{COMMAND_END}\n"
+        )
+        state = {
+            "scope": {"issue-14": {"number": 14, "developer": "owner"}},
+            "bugs": {},
+        }
+        expected = body.replace(
+            table,
+            "- [ ] #14\n\n  > **Assignee** @owner · **Pull requests** -",
+            1,
+        )
+        self.assertEqual(release_body(body, state, REPOSITORY), expected)
+
     def test_native_pr_display_keeps_issue_identity(self):
         body = PLAN.replace(
             "initial integration []",
