@@ -69,10 +69,11 @@ reason: Initial scope.
 class ParserContracts(unittest.TestCase):
     def test_historical_release_keeps_text_and_gets_the_moved_overview(self):
         original = "## Version information\n\nLegacy release notes.\n"
-        updated = release_body(original, {"scope": {}, "bugs": {}})
+        state = {"scope": {}, "bugs": {}}
+        updated = release_body(original, state, REPOSITORY)
         self.assertTrue(updated.startswith(original))
         self.assertIn("### Release Overview", updated)
-        self.assertEqual(release_body(updated, {"scope": {}, "bugs": {}}), updated)
+        self.assertEqual(release_body(updated, state, REPOSITORY), updated)
 
     def test_managed_regions_are_idempotent_and_do_not_change_scope(self):
         state = {
@@ -82,33 +83,40 @@ class ParserContracts(unittest.TestCase):
             "version": "0.12.0",
             "archive": 8,
         }
-        updated = release_body(PLAN, state)
+        updated = release_body(PLAN, state, REPOSITORY)
         self.assertEqual(
             parse_release(updated, REPOSITORY), parse_release(PLAN, REPOSITORY)
         )
-        self.assertEqual(release_body(updated, state), updated)
+        self.assertEqual(release_body(updated, state, REPOSITORY), updated)
         self.assertLess(updated.index(NAV_START), updated.index("version:"))
         self.assertTrue(updated.rstrip().endswith(OVERVIEW_END))
         self.assertEqual(updated.count(OVERVIEW_START), 1)
 
     def test_overview_unifies_requirement_and_bug_prs(self):
         state = {
-            "scope": {"issue-14": {"number": 14, "developer": "owner"}},
+            "scope": {
+                "issue-14": {"number": 14, "developer": "owner"},
+                "issue-12": {"number": 12},
+            },
             "bugs": {"8": {}},
             "prs": {"20": {"requirements": [14], "bugs": [8], "merged": True}},
             "observed": {"8": {"state": "closed", "assignees": ["fixer"]}},
         }
-        body = release_body(PLAN, state)
-        self.assertIn("| Issue | Pull requests | Assignee | State |", body)
-        self.assertIn("| #14 | #20 (merged) | @owner |", body)
-        self.assertIn("| #8 | #20 (merged) | @fixer | closed", body)
-        self.assertNotIn("| Item |", body)
-        self.assertNotIn("缺陷与修复", body)
+        body = release_body(PLAN, state, REPOSITORY)
+        _, overview = checklist_region(body, "overview")
+        link = f"[#20](https://github.com/{REPOSITORY}/pull/20) (merged)"
+        self.assertIn(
+            f"- [ ] #14\n\n  > **Assignee** @owner · **Pull requests** {link}\n\n"
+            "- [ ] #12\n\n  > **Assignee** - · **Pull requests** -\n\n"
+            "---\n\n"
+            f"- [x] #8\n\n  > **Assignee** @fixer · **Pull requests** {link}",
+            overview,
+        )
 
     def test_malformed_managed_markers_preserve_source(self):
         body = PLAN + OVERVIEW_START + "Human text"
         with self.assertRaises(OperationError):
-            release_body(body, {"scope": {}, "bugs": {}})
+            release_body(body, {"scope": {}, "bugs": {}}, REPOSITORY)
 
     def test_native_pr_display_keeps_issue_identity(self):
         body = PLAN.replace(
@@ -823,7 +831,13 @@ class RepositoryOperations(unittest.TestCase):
         self.assertEqual(self.api.prs[10]["milestone"]["number"], 1)
         body = self.api.items[1]["body"]
         self.assertIn("    - #10 | merged\n    - #11 | open", body)
-        self.assertIn(f"| #{requirement} | #10 (merged), #11 (open) |", body)
+        _, overview = checklist_region(body, "overview")
+        self.assertIn(f"- [ ] #{requirement}\n", overview)
+        self.assertIn(
+            f"**Pull requests** [#10](https://github.com/{REPOSITORY}/pull/10) (merged), "
+            f"[#11](https://github.com/{REPOSITORY}/pull/11) (open)",
+            overview,
+        )
         self.assertNotIn("Same PR", body)
 
     def test_update_imports_pending_prs_and_clears_rendered_rows_after_unlink(self):
@@ -844,7 +858,9 @@ class RepositoryOperations(unittest.TestCase):
         self.controller.initialize_or_update(1, "update")
         self.controller.initialize_or_update(1, "update")
         self.assertEqual(self.api.native_links[requirement], [(10, REPOSITORY)])
-        self.assertIn(f"| #{requirement} | #10 (open) |", self.api.items[1]["body"])
+        _, overview = checklist_region(self.api.items[1]["body"], "overview")
+        self.assertIn(f"- [ ] #{requirement}\n", overview)
+        self.assertIn(f"[#10](https://github.com/{REPOSITORY}/pull/10) (open)", overview)
         self.assertIn("P_TEST", self.api.projects[pr["node_id"]])
 
         del self.api.native_links[requirement]
@@ -937,7 +953,7 @@ class RepositoryOperations(unittest.TestCase):
         self.assertEqual(report["open_issues"], [1, 2, 3, 4, 8])
         self.assertEqual(report["issues_without_pr"], [3, 4, 8])
         self.assertEqual(report["status"], "blocked")
-        self.assertIn("| #8 |", self.api.items[1]["body"])
+        self.assertIn("- [ ] #8\n", self.api.items[1]["body"])
         self.assertNotIn('"status": "stale"', self.api.items[1]["body"])
 
     def test_release_check_distinguishes_open_and_closed_unmerged_prs(self):
@@ -1169,7 +1185,10 @@ class RepositoryOperations(unittest.TestCase):
         self.assertEqual(state["prs"]["10"]["requirements"], [3])
         self.assertEqual(self.api.prs[10]["milestone"]["number"], 1)
         self.assertIn("P_NATIVE", self.api.projects["I_10"])
-        self.assertIn("| #3 | #10 (open)", self.api.items[1]["body"])
+        self.assertIn(
+            f"**Pull requests** [#10](https://github.com/{REPOSITORY}/pull/10) (open)",
+            self.api.items[1]["body"],
+        )
         self.api.native_links[3] = []
         self.controller.reconcile(1)
         self.assertEqual(self.api.prs[10]["milestone"]["number"], 1)
@@ -1192,7 +1211,10 @@ class RepositoryOperations(unittest.TestCase):
         pr.update(state="closed", merged_at="2026-11-19T00:00:00Z")
         self.controller.reconcile(1)
         self.assertTrue(self.api.native_include_closed)
-        self.assertIn("| #3 | #10 (merged)", self.api.items[1]["body"])
+        self.assertIn(
+            f"**Pull requests** [#10](https://github.com/{REPOSITORY}/pull/10) (merged)",
+            self.api.items[1]["body"],
+        )
 
     def test_native_link_pagination_and_repository_filter(self):
         self.api.native_links[3] = [
@@ -1221,7 +1243,7 @@ class RepositoryOperations(unittest.TestCase):
         self.assertFalse(self.api.comments)
         self.assertFalse(self.api.internal_items)
         self.assertIn("**Bug Archive:** #2", original)
-        self.assertIn("| #3 |", original)
+        self.assertIn("- [ ] #3\n", original)
         self.assertEqual(self.api.items[1]["body"], original)
 
     def test_human_checklist_edits_survive_display_refresh(self):

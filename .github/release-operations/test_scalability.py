@@ -90,7 +90,7 @@ class NativeStateContracts(unittest.TestCase):
             },
             "issues",
         )
-        self.assertNotIn("| #4 |", self.api.items[1]["body"])
+        self.assertNotRegex(self.api.items[1]["body"], r"(?m)^- \[[ x]\] #4$")
         _, report = self.controller.release_check(1)
         self.assertNotIn(4, report["open_issues"])
         self.assertFalse(report["pending_requirements"])
@@ -107,7 +107,10 @@ class NativeStateContracts(unittest.TestCase):
             self.api.items[number] = item
         self.api.add_pr(10, "Fixes #3")
         self.controller.handle({"schedule": "*/15 * * * *"}, "schedule")
-        self.assertIn("| #3 | #10 (open)", self.api.items[1]["body"])
+        self.assertIn(
+            f"**Pull requests** [#10](https://github.com/{REPOSITORY}/pull/10) (open)",
+            self.api.items[1]["body"],
+        )
         self.assertLess(len(self.api.calls), 18)
         self.assertFalse(
             any(
@@ -221,7 +224,10 @@ class NativeStateContracts(unittest.TestCase):
                 OperationError, "Release #1: archive unavailable"
             ):
                 self.controller.handle({}, "schedule")
-        self.assertIn("| #52 | - | @harrisonyhq | closed", self.api.items[50]["body"])
+        self.assertIn(
+            "- [x] #52\n\n  > **Assignee** @harrisonyhq · **Pull requests** -",
+            self.api.items[50]["body"],
+        )
         self.assertIn(
             "Synchronization failed · archive unavailable", self.api.items[1]["body"]
         )

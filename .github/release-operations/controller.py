@@ -536,7 +536,7 @@ class Controller(
             print(f"Cannot refresh PR references for #{source['number']}: {error}")
             warnings.append(f"Checklist requires attention · {error}")
             body = original
-        patched = release_body(body, state)
+        patched = release_body(body, state, self.repository)
         _, attention = checklist_region(original, "attention")
         pin_warning = None
         if any(line.startswith(PIN_WARNING_PREFIX) for line in attention.splitlines()):

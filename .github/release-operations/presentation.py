@@ -83,7 +83,7 @@ def update_attention(body, *, warnings=None, pin_warning=None):
     return set_checklist_region(body, "attention", content)
 
 
-def release_body(body, state):
+def release_body(body, state, repository):
     if "### Release Information" in body:
         navigation = []
         if state.get("milestone"):
@@ -112,25 +112,32 @@ def release_body(body, state):
             status = "draft"
         else:
             status = "open"
+        link = f"[#{number}](https://github.com/{repository}/pull/{number})"
         for issue in record.get("requirements", []) + record.get("bugs", []):
-            requests.setdefault(issue, []).append(f"#{number} ({status})")
+            requests.setdefault(issue, []).append(f"{link} ({status})")
 
     rows = []
     entries = {str(e["number"]): e for e in state["scope"].values()}
-    entries.update({n: entries.get(n, {}) for n in state.get("bugs", {})})
+    bugs = state.get("bugs", {})
+    entries.update({n: entries.get(n, {}) for n in bugs})
+    first_bug = next(iter(bugs), None)
     for number, entry in entries.items():
+        if number == first_bug and rows:
+            rows.append("---")
         observed = state.get("observed", {}).get(number, {})
         owners = observed.get(
             "assignees", ([entry["developer"]] if entry.get("developer") else [])
         )
-        prs = requests.get(int(number), [])
+        assignee = ", ".join("@" + owner for owner in owners) or "-"
+        pull_requests = ", ".join(requests.get(int(number), [])) or "-"
+        checked = "x" if observed.get("state") == "closed" else " "
         rows.append(
-            f"| #{number} | {', '.join(prs) or '-'} | {', '.join('@' + owner for owner in owners) or '-'} | {observed.get('state', 'open')} |"
+            f"- [{checked}] #{number}\n\n"
+            f"  > **Assignee** {assignee} · **Pull requests** {pull_requests}"
         )
     overview = (
         "### Release Overview\n\nAutomatically maintained by the release bot.\n\n"
-        "| Issue | Pull requests | Assignee | State |\n| --- | --- | --- | --- |\n"
-        + "\n".join(rows)
+        + "\n\n".join(rows)
     )
     return set_checklist_region(body, "overview", overview)
 
