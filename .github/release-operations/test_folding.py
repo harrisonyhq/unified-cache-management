@@ -13,7 +13,7 @@ class FoldingContracts(unittest.TestCase):
         prefix, rest = body.split("### Requirements", 1)
         requirements, change = rest.split("### Change Log", 1)
         body = prefix + "### Change Log" + change + "\n### Requirements" + requirements
-        body = release_body(body, {"scope": {}, "bugs": {}})
+        body = release_body(body, {"scope": {}, "bugs": {}}, fixtures.REPOSITORY)
         updated = patch_pull_requests(body, {}, fixtures.REPOSITORY)
         self.assertEqual(
             parse_release(updated, fixtures.REPOSITORY),

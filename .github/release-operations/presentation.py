@@ -19,7 +19,7 @@ def replace_region(body, start, end, content):
     return body, start + "\n" + content + "\n" + end
 
 
-def release_body(body, state):
+def release_body(body, state, repository):
     if "### Release Information" in body:
         navigation = []
         if state.get("milestone"):
@@ -40,8 +40,12 @@ def release_body(body, state):
 
     rows = []
     entries = {str(e["number"]): e for e in state["scope"].values()}
-    entries.update({n: entries.get(n, {}) for n in state.get("bugs", {})})
+    bugs = state.get("bugs", {})
+    entries.update({n: entries.get(n, {}) for n in bugs})
+    first_bug = next(iter(bugs), None)
     for number, entry in entries.items():
+        if number == first_bug and rows:
+            rows.append("---")
         observed = state.get("observed", {}).get(number, {})
         owners = observed.get(
             "assignees", ([entry["developer"]] if entry.get("developer") else [])
@@ -58,9 +62,14 @@ def release_body(body, state):
                         else "draft" if record.get("draft") else "open"
                     )
                 )
-                prs.append(f"#{pr} ({status})")
+                link = f"[#{pr}](https://github.com/{repository}/pull/{pr})"
+                prs.append(f"{link} ({status})")
+        assignee = ", ".join("@" + owner for owner in owners) or "-"
+        pull_requests = ", ".join(prs) or "-"
+        checked = "x" if observed.get("state") == "closed" else " "
         rows.append(
-            f"| #{number} | {', '.join(prs) or '-'} | {', '.join('@' + owner for owner in owners) or '-'} | {observed.get('state', 'open')} |"
+            f"- [{checked}] #{number}\n\n"
+            f"  > **Assignee** {assignee} · **Pull requests** {pull_requests}"
         )
     overview = (
         "### Release Overview\n\nAutomatically maintained by the release bot.\n\n"
@@ -87,10 +96,7 @@ def release_body(body, state):
             + "\n".join("- " + w for w in warnings)
             + "\n\n</details>\n\n"
         )
-    overview += (
-        "| Issue | Pull requests | Assignee | State |\n| --- | --- | --- | --- |\n"
-        + "\n".join(rows)
-    )
+    overview += "\n\n".join(rows)
     check = state.get("release_check")
     if check:
         overview += "\n\n### Release Check\n\n"
